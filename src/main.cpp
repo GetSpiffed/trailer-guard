@@ -66,6 +66,12 @@ XPowersAXP2101 axp;
 HardwareSerial GNSS(1);
 TinyGPSPlus gps;
 
+// GPS stats (voor OLED diagnose)
+static uint32_t gpsChars = 0;
+static uint32_t gpsSentences = 0;
+static uint32_t gpsLastStatsMs = 0;
+static uint16_t gpsCharsPerSec = 0;
+
 // OLED: SH1106 128x64, SW I2C met expliciete pins
 U8G2_SH1106_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, DEV_SCL, DEV_SDA, U8X8_PIN_NONE);
 
@@ -125,6 +131,20 @@ static AppState app;
 static uint32_t nextChgLedBlinkMs = 0;
 static uint32_t chgLedPulseEndMs = 0;
 
+// ---------- GPS fix policy (structureel) ----------
+static inline bool gpsHasFixNow(TinyGPSPlus& g) {
+  // "fix" = recent + kwaliteit ok
+  bool hasFix = (g.location.age() < 5000);
+
+  // HDOP is in honderdsten (bv 150 = 1.50). >500 => >5.0 is meh.
+  if (g.hdop.isValid() && g.hdop.value() > 500) hasFix = false;
+
+  // optioneel maar handig: zonder sats geen echte fix
+  if (g.satellites.isValid() && g.satellites.value() < 4) hasFix = false;
+
+  return hasFix;
+}
+
 // ---------- PMU helpers ----------
 static void setChgLed(bool on) {
   axp.setChargingLedMode(on ? XPOWERS_CHG_LED_ON : XPOWERS_CHG_LED_OFF);
@@ -176,8 +196,6 @@ static uint16_t readVbusMv() {
   return (uint16_t)lroundf(v);
 }
 
-// Battery current: probeer charge current. Als dit bij jou niet compilet,
-// vervang deze ene regel door een methode die wél bestaat in jouw XPowersLib build.
 static uint8_t readBatteryPercent() {
   if (!axp.isBatteryConnect()) return 0;
   return (uint8_t)axp.getBatteryPercent();
@@ -225,23 +243,24 @@ struct DisplayManager {
     }
   }
 
-  // Titelregel opgeofferd; we gebruiken 2 regels voor power debug
   void render(const AppState& state, TinyGPSPlus& gps,
-            uint16_t battMv, uint8_t battPct,
-            int chgRaw, bool vbus, uint16_t vbusMv) {
+              uint16_t battMv, uint8_t battPct,
+              int chgRaw, bool vbus, uint16_t vbusMv) {
+
+    (void)chgRaw; (void)vbus; (void)vbusMv; // nu niet getoond (later evt)
 
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x10_tf);
 
-    // 1 regel: "BAT 3875mV 82%"
     char line[32];
+
+    // 1) Battery
     snprintf(line, sizeof(line), "BAT %umV %u%%",
              (unsigned)battMv,
              (unsigned)battPct);
     u8g2.drawStr(0, 12, line);
 
-
-    // gate screen
+    // Gate screen
     if (state.gate != RunGate::Running) {
       u8g2.drawStr(0, 40, "Press BOOT to start");
       u8g2.drawStr(0, 58, "(short press)");
@@ -249,20 +268,32 @@ struct DisplayManager {
       return;
     }
 
+    // 2) Join status
     snprintf(line, sizeof(line), "JOIN:%s", joinStatusText(state.joinStatus));
     u8g2.drawStr(0, 34, line);
 
+    // 3) LoRa error
     snprintf(line, sizeof(line), "ERR:%d", (int)state.lastLoraErr);
     u8g2.drawStr(0, 46, line);
 
+    // 4) GPS diagnostics (zelfde fix-policy als payload)
     int sat = gps.satellites.isValid() ? gps.satellites.value() : 0;
-    if (gps.location.isValid()) {
-      snprintf(line, sizeof(line), "GPS:FIX(%d)", sat);
-    } else {
-      snprintf(line, sizeof(line), "GPS:NO(%d)", sat);
-    }
-    u8g2.drawStr(0, 58, line);
+    uint32_t ageMs = gps.location.isValid() ? gps.location.age() : 999999;
+    bool hasFix = gpsHasFixNow(gps);
 
+    if (hasFix) {
+      snprintf(line, sizeof(line),
+               "GPS FIX S:%d A:%lus",
+               sat,
+               (unsigned)(ageMs / 1000));
+    } else {
+      snprintf(line, sizeof(line),
+               "GPS NO  %uc/s S:%d",
+               (unsigned)gpsCharsPerSec,
+               sat);
+    }
+
+    u8g2.drawStr(0, 58, line);
     u8g2.sendBuffer();
   }
 };
@@ -275,7 +306,18 @@ struct GnssManager {
 
   void update() {
     while (GNSS.available()) {
-      gps.encode((char)GNSS.read());
+      char c = (char)GNSS.read();
+      gpsChars++;
+      if (gps.encode(c)) {
+        gpsSentences++;
+      }
+    }
+
+    uint32_t now = millis();
+    if (now - gpsLastStatsMs >= 1000) {
+      gpsCharsPerSec = (uint16_t)gpsChars;
+      gpsChars = 0;
+      gpsLastStatsMs = now;
     }
   }
 };
@@ -414,14 +456,19 @@ struct LoRaWanManager {
     if (n == 0) return;
 
     int16_t st = node.sendReceive(payload, n, LORAWAN_FPORT);
-    state.lastLoraErr = st;
-    if (st == RADIOLIB_ERR_NONE) {
-      state.lastLoraErr = 0;
-      state.lastUplinkOkMs = millis();
-      state.uplinkStatus = UplinkStatus::Ok;
-    } else {
-      state.uplinkStatus = UplinkStatus::Fail;
-    }
+
+    bool ok = (st == RADIOLIB_ERR_NONE
+#ifdef RADIOLIB_ERR_RX_TIMEOUT
+        || st == RADIOLIB_ERR_RX_TIMEOUT
+#endif
+#ifdef RADIOLIB_ERR_TIMEOUT
+        || st == RADIOLIB_ERR_TIMEOUT
+#endif
+    );
+
+    state.uplinkStatus = ok ? UplinkStatus::Ok : UplinkStatus::Fail;
+    state.lastUplinkOkMs = ok ? millis() : state.lastUplinkOkMs;
+    state.lastLoraErr = st; // laat staan voor debug
   }
 };
 
@@ -434,7 +481,8 @@ static LoRaWanManager lorawanManager;
 static size_t buildPayload(uint8_t* out, size_t maxLen) {
   if (maxLen < 13) return 0;
 
-  bool hasFix = gps.location.isValid();
+  // structureel: zelfde fix policy als OLED
+  bool hasFix = gpsHasFixNow(gps);
   uint8_t msgType = hasFix ? 0x01 : 0x02;
 
   int32_t latE5 = 0;
@@ -482,46 +530,78 @@ static void disableRadios() {
 
 // gate state machine (short press)
 static void updateStartGate() {
+  // tunables
+  static constexpr uint32_t DEBOUNCE_MS   = 25;   // stabiel voordat we 'm echt vinden
+  static constexpr uint32_t MIN_PRESS_MS  = 20;   // kortste tap die we accepteren
+  static constexpr uint32_t MAX_PRESS_MS  = 1200; // alles daarboven negeren (optioneel)
+
   static bool inited = false;
-  static bool wasDown = false;
-  static uint32_t downMs = 0;
+
+  // raw + debounced state
+  static bool rawLast = true;          // pullup => idle HIGH
+  static uint32_t rawChangeMs = 0;
+
+  static bool stableState = true;      // debounced level
+  static bool stableLast  = true;
+
+  static uint32_t pressStartMs = 0;
 
   if (!inited) {
     pinMode(BOOT_PIN, INPUT_PULLUP);
+    rawLast = digitalRead(BOOT_PIN);
+    stableState = rawLast;
+    stableLast = rawLast;
+    rawChangeMs = millis();
     inited = true;
   }
 
   if (app.gate == RunGate::Running) return;
 
-  bool down = (digitalRead(BOOT_PIN) == LOW); // actief-low
+  const uint32_t now = millis();
+  const bool raw = (digitalRead(BOOT_PIN) == LOW) ? false : true; // true=HIGH idle, false=pressed
 
-  // detecteer "net ingedrukt"
-  if (down && !wasDown) {
-    downMs = millis();
+  // track raw changes
+  if (raw != rawLast) {
+    rawLast = raw;
+    rawChangeMs = now;
   }
 
-  // detecteer "net losgelaten" + debounce/short press
-  if (!down && wasDown) {
-    if (millis() - downMs >= 30) {
-      app.gate = RunGate::Running;
+  // update debounced state if raw has been stable long enough
+  if ((now - rawChangeMs) >= DEBOUNCE_MS) {
+    stableState = rawLast;
+  }
 
-      app.joinStatus = JoinStatus::Boot;
-      app.nextJoinAttemptMs = millis();
-      app.joined = false;
-      app.uplinkSent = false;
-      app.uplinkStatus = UplinkStatus::Idle;
-      app.lastLoraErr = 0;
-      app.lastUplinkOkMs = 0;
-      app.sessionRestored = false;
-      app.sessionChecked = false;
-      app.joinAttempted = false;
-      app.restoreUplinkAttempts = 0;
-      app.nextRestoreUplinkMs = 0;
+  // edge detect on debounced signal
+  if (stableState != stableLast) {
+    stableLast = stableState;
+
+    // pressed (debounced)
+    if (stableState == false) { // LOW = pressed
+      pressStartMs = now;
+    } else {
+      // released (debounced) => decide short press
+      uint32_t dur = now - pressStartMs;
+      if (dur >= MIN_PRESS_MS && dur <= MAX_PRESS_MS) {
+        app.gate = RunGate::Running;
+
+        // reset run-state
+        app.joinStatus = JoinStatus::Boot;
+        app.nextJoinAttemptMs = now;
+        app.joined = false;
+        app.uplinkSent = false;
+        app.uplinkStatus = UplinkStatus::Idle;
+        app.lastLoraErr = 0;
+        app.lastUplinkOkMs = 0;
+        app.sessionRestored = false;
+        app.sessionChecked = false;
+        app.joinAttempted = false;
+        app.restoreUplinkAttempts = 0;
+        app.nextRestoreUplinkMs = 0;
+      }
     }
   }
-
-  wasDown = down;
 }
+
 
 static void updateJoinFlow() {
   uint32_t now = millis();
@@ -720,36 +800,3 @@ void loop() {
     displayManager.render(app, gps, battMv, battPct, chgRaw, vbus, vbusMv);
   }
 }
-  template <typename Node, typename Session>
-  static auto setNodeSession(Node& target, const Session& session, int)
-      -> decltype(target.setSession(&session), int16_t()) {
-    return target.setSession(&session);
-  }
-
-  template <typename Node, typename Session>
-  static auto setNodeSession(Node& target, const Session& session, long)
-      -> decltype(target.setSession(session), int16_t()) {
-    return target.setSession(session);
-  }
-
-  template <typename Node, typename Session>
-  static int16_t setNodeSession(Node&, const Session&, ...) {
-    return RADIOLIB_ERR_UNSUPPORTED;
-  }
-
-  template <typename Node, typename Session>
-  static auto getNodeSession(Node& target, Session& session, int)
-      -> decltype(target.getSession(&session), int16_t()) {
-    return target.getSession(&session);
-  }
-
-  template <typename Node, typename Session>
-  static auto getNodeSession(Node& target, Session& session, long)
-      -> decltype(target.getSession(session), int16_t()) {
-    return target.getSession(session);
-  }
-
-  template <typename Node, typename Session>
-  static int16_t getNodeSession(Node&, Session&, ...) {
-    return RADIOLIB_ERR_UNSUPPORTED;
-  }
