@@ -74,6 +74,10 @@ uint32_t lastDrawMs = 0;
 // ---------------- LoRaWAN (RadioLib) ----------------
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 LoRaWANNode node(&radio, &EU868);
+using LoRaWANSession = LoRaWANSchemeSession_t;
+#ifndef RADIOLIB_ERR_UNSUPPORTED
+#define RADIOLIB_ERR_UNSUPPORTED RADIOLIB_ERR_UNKNOWN
+#endif
 
 enum class JoinStatus : uint8_t {
   Boot,
@@ -280,7 +284,7 @@ static size_t buildPayload(uint8_t* out, size_t maxLen);
 
 // ---- LoRaWAN Manager ----
 struct LoRaWanManager {
-  static bool loadSession(LoRaWANSession_t& session) {
+  static bool loadSession(LoRaWANSession& session) {
     Preferences prefs;
     if (!prefs.begin("lorawan", true)) return false;
     bool valid = prefs.getBool("valid", false);
@@ -294,7 +298,7 @@ struct LoRaWanManager {
     return read == sizeof(session);
   }
 
-  static bool saveSession(const LoRaWANSession_t& session) {
+  static bool saveSession(const LoRaWANSession& session) {
     Preferences prefs;
     if (!prefs.begin("lorawan", false)) return false;
     prefs.putBool("valid", true);
@@ -309,6 +313,40 @@ struct LoRaWanManager {
     prefs.remove("valid");
     prefs.remove("session");
     prefs.end();
+  }
+
+  template <typename Node, typename Session>
+  static auto setNodeSession(Node& target, const Session& session, int)
+      -> decltype(target.setSession(&session), int16_t()) {
+    return target.setSession(&session);
+  }
+
+  template <typename Node, typename Session>
+  static auto setNodeSession(Node& target, const Session& session, long)
+      -> decltype(target.setSession(session), int16_t()) {
+    return target.setSession(session);
+  }
+
+  template <typename Node, typename Session>
+  static int16_t setNodeSession(Node&, const Session&, ...) {
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
+
+  template <typename Node, typename Session>
+  static auto getNodeSession(Node& target, Session& session, int)
+      -> decltype(target.getSession(&session), int16_t()) {
+    return target.getSession(&session);
+  }
+
+  template <typename Node, typename Session>
+  static auto getNodeSession(Node& target, Session& session, long)
+      -> decltype(target.getSession(session), int16_t()) {
+    return target.getSession(session);
+  }
+
+  template <typename Node, typename Session>
+  static int16_t getNodeSession(Node&, Session&, ...) {
+    return RADIOLIB_ERR_UNSUPPORTED;
   }
 
   bool initRadio(AppState& state) {
@@ -333,8 +371,8 @@ struct LoRaWanManager {
     return true;
   }
 
-  bool restoreSession(AppState& state, const LoRaWANSession_t& session) {
-    int16_t st = node.setSession(&session);
+  bool restoreSession(AppState& state, const LoRaWANSession& session) {
+    int16_t st = setNodeSession(node, session, 0);
     if (st != RADIOLIB_ERR_NONE) {
       state.lastLoraErr = st;
       return false;
@@ -360,8 +398,8 @@ struct LoRaWanManager {
     return true;
   }
 
-  bool fetchSession(AppState& state, LoRaWANSession_t& session) {
-    int16_t st = node.getSession(&session);
+  bool fetchSession(AppState& state, LoRaWANSession& session) {
+    int16_t st = getNodeSession(node, session, 0);
     if (st != RADIOLIB_ERR_NONE) {
       state.lastLoraErr = st;
       return false;
@@ -504,7 +542,7 @@ static void updateJoinFlow() {
 
   if (app.joinStatus == JoinStatus::Restoring && !app.sessionChecked) {
     app.sessionChecked = true;
-    LoRaWANSession_t session;
+    LoRaWANSession session;
     bool haveSession = lorawanManager.loadSession(session);
     if (haveSession && lorawanManager.restoreSession(app, session)) {
       app.joined = true;
@@ -532,7 +570,7 @@ static void updateJoinFlow() {
     if (ok) {
       app.joined = true;
       app.joinStatus = JoinStatus::JoinOk;
-      LoRaWANSession_t session;
+      LoRaWANSession session;
       if (lorawanManager.fetchSession(app, session)) {
         lorawanManager.saveSession(session);
       }
@@ -574,7 +612,7 @@ static void updateUplinkFlow() {
 
     if (app.uplinkStatus == UplinkStatus::Ok) {
       app.uplinkSent = true;
-      LoRaWANSession_t session;
+      LoRaWANSession session;
       if (lorawanManager.fetchSession(app, session)) {
         lorawanManager.saveSession(session);
       }
@@ -600,7 +638,7 @@ static void updateUplinkFlow() {
   lorawanManager.sendOnce(app);
   app.uplinkSent = true;
   if (app.uplinkStatus == UplinkStatus::Ok) {
-    LoRaWANSession_t session;
+    LoRaWANSession session;
     if (lorawanManager.fetchSession(app, session)) {
       lorawanManager.saveSession(session);
     }
@@ -682,3 +720,36 @@ void loop() {
     displayManager.render(app, gps, battMv, battPct, chgRaw, vbus, vbusMv);
   }
 }
+  template <typename Node, typename Session>
+  static auto setNodeSession(Node& target, const Session& session, int)
+      -> decltype(target.setSession(&session), int16_t()) {
+    return target.setSession(&session);
+  }
+
+  template <typename Node, typename Session>
+  static auto setNodeSession(Node& target, const Session& session, long)
+      -> decltype(target.setSession(session), int16_t()) {
+    return target.setSession(session);
+  }
+
+  template <typename Node, typename Session>
+  static int16_t setNodeSession(Node&, const Session&, ...) {
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
+
+  template <typename Node, typename Session>
+  static auto getNodeSession(Node& target, Session& session, int)
+      -> decltype(target.getSession(&session), int16_t()) {
+    return target.getSession(&session);
+  }
+
+  template <typename Node, typename Session>
+  static auto getNodeSession(Node& target, Session& session, long)
+      -> decltype(target.getSession(session), int16_t()) {
+    return target.getSession(session);
+  }
+
+  template <typename Node, typename Session>
+  static int16_t getNodeSession(Node&, Session&, ...) {
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
