@@ -536,15 +536,12 @@ static void updateStartGate() {
   static constexpr uint32_t MAX_PRESS_MS  = 1200; // alles daarboven negeren (optioneel)
 
   static bool inited = false;
-
-  // raw + debounced state
-  static bool rawLast = true;          // pullup => idle HIGH
-  static uint32_t rawChangeMs = 0;
-
-  static bool stableState = true;      // debounced level
-  static bool stableLast  = true;
-
-  static uint32_t pressStartMs = 0;
+  static bool lastReadDown = false;
+  static bool stableDown = false;
+  static uint32_t lastChangeMs = 0;
+  static uint32_t downMs = 0;
+  static const uint32_t debounceMs = 25;
+  static const uint32_t minPressMs = 30;
 
   if (!inited) {
     pinMode(BOOT_PIN, INPUT_PULLUP);
@@ -557,34 +554,22 @@ static void updateStartGate() {
 
   if (app.gate == RunGate::Running) return;
 
-  const uint32_t now = millis();
-  const bool raw = (digitalRead(BOOT_PIN) == LOW) ? false : true; // true=HIGH idle, false=pressed
+  bool down = (digitalRead(BOOT_PIN) == LOW); // actief-low
+  uint32_t now = millis();
 
-  // track raw changes
-  if (raw != rawLast) {
-    rawLast = raw;
-    rawChangeMs = now;
+  if (down != lastReadDown) {
+    lastChangeMs = now;
+    lastReadDown = down;
   }
 
-  // update debounced state if raw has been stable long enough
-  if ((now - rawChangeMs) >= DEBOUNCE_MS) {
-    stableState = rawLast;
-  }
-
-  // edge detect on debounced signal
-  if (stableState != stableLast) {
-    stableLast = stableState;
-
-    // pressed (debounced)
-    if (stableState == false) { // LOW = pressed
-      pressStartMs = now;
+  if (now - lastChangeMs >= debounceMs && down != stableDown) {
+    stableDown = down;
+    if (stableDown) {
+      downMs = now;
     } else {
-      // released (debounced) => decide short press
-      uint32_t dur = now - pressStartMs;
-      if (dur >= MIN_PRESS_MS && dur <= MAX_PRESS_MS) {
+      if (now - downMs >= minPressMs) {
         app.gate = RunGate::Running;
 
-        // reset run-state
         app.joinStatus = JoinStatus::Boot;
         app.nextJoinAttemptMs = now;
         app.joined = false;
@@ -608,6 +593,7 @@ static void updateJoinFlow() {
 
   if (app.joinStatus == JoinStatus::Boot) {
     app.joinStatus = JoinStatus::RadioInit;
+    return;
   }
 
   if (app.joinStatus == JoinStatus::RadioInit) {
@@ -618,6 +604,7 @@ static void updateJoinFlow() {
     } else {
       app.joinStatus = JoinStatus::JoinFail;
     }
+    return;
   }
 
   if (app.joinStatus == JoinStatus::Restoring && !app.sessionChecked) {
@@ -634,9 +621,11 @@ static void updateJoinFlow() {
     }
 
     app.joinStatus = JoinStatus::RestoreFail;
+    app.nextJoinAttemptMs = now + 400;
+    return;
   }
 
-  if ((app.joinStatus == JoinStatus::RestoreFail || app.joinStatus == JoinStatus::Joining) && !app.joined) {
+  if (app.joinStatus == JoinStatus::RestoreFail && !app.joined) {
     if (app.joinAttempted) {
       app.joinStatus = JoinStatus::JoinFail;
       return;
@@ -644,8 +633,16 @@ static void updateJoinFlow() {
 
     if (now < app.nextJoinAttemptMs) return;
 
-    app.joinAttempted = true;
     app.joinStatus = JoinStatus::Joining;
+    app.nextJoinAttemptMs = now + 1;
+    return;
+  }
+
+  if (app.joinStatus == JoinStatus::Joining && !app.joined) {
+    if (app.joinAttempted) return;
+    if (now < app.nextJoinAttemptMs) return;
+
+    app.joinAttempted = true;
     bool ok = lorawanManager.join(app);
     if (ok) {
       app.joined = true;
@@ -658,6 +655,7 @@ static void updateJoinFlow() {
       app.lastUplinkOkMs = 0;
       app.joinStatus = JoinStatus::JoinFail;
     }
+    return;
   }
 }
 
