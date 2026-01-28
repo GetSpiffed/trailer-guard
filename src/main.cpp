@@ -160,7 +160,7 @@ struct DisplayManager {
     }
   }
 
-  void render(const AppState& state, const TinyGPSPlus& gps) {
+  void render(const AppState& state, TinyGPSPlus& gps) {
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x10_tf);
 
@@ -208,6 +208,8 @@ struct GnssManager {
     }
   }
 };
+
+static size_t buildPayload(uint8_t* out, size_t maxLen);
 
 // ---- LoRaWAN Manager ----
 struct LoRaWanManager {
@@ -269,10 +271,14 @@ struct LoRaWanManager {
   }
 };
 
+
+
 static PowerManager powerManager;
 static DisplayManager displayManager;
 static GnssManager gnssManager;
 static LoRaWanManager lorawanManager;
+
+
 
 // payload: 13 bytes
 static size_t buildPayload(uint8_t* out, size_t maxLen) {
