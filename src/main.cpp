@@ -483,8 +483,12 @@ static void disableRadios() {
 // gate state machine (short press)
 static void updateStartGate() {
   static bool inited = false;
-  static bool wasDown = false;
+  static bool lastReadDown = false;
+  static bool stableDown = false;
+  static uint32_t lastChangeMs = 0;
   static uint32_t downMs = 0;
+  static const uint32_t debounceMs = 25;
+  static const uint32_t minPressMs = 30;
 
   if (!inited) {
     pinMode(BOOT_PIN, INPUT_PULLUP);
@@ -494,33 +498,36 @@ static void updateStartGate() {
   if (app.gate == RunGate::Running) return;
 
   bool down = (digitalRead(BOOT_PIN) == LOW); // actief-low
+  uint32_t now = millis();
 
-  // detecteer "net ingedrukt"
-  if (down && !wasDown) {
-    downMs = millis();
+  if (down != lastReadDown) {
+    lastChangeMs = now;
+    lastReadDown = down;
   }
 
-  // detecteer "net losgelaten" + debounce/short press
-  if (!down && wasDown) {
-    if (millis() - downMs >= 30) {
-      app.gate = RunGate::Running;
+  if (now - lastChangeMs >= debounceMs && down != stableDown) {
+    stableDown = down;
+    if (stableDown) {
+      downMs = now;
+    } else {
+      if (now - downMs >= minPressMs) {
+        app.gate = RunGate::Running;
 
-      app.joinStatus = JoinStatus::Boot;
-      app.nextJoinAttemptMs = millis();
-      app.joined = false;
-      app.uplinkSent = false;
-      app.uplinkStatus = UplinkStatus::Idle;
-      app.lastLoraErr = 0;
-      app.lastUplinkOkMs = 0;
-      app.sessionRestored = false;
-      app.sessionChecked = false;
-      app.joinAttempted = false;
-      app.restoreUplinkAttempts = 0;
-      app.nextRestoreUplinkMs = 0;
+        app.joinStatus = JoinStatus::Boot;
+        app.nextJoinAttemptMs = now;
+        app.joined = false;
+        app.uplinkSent = false;
+        app.uplinkStatus = UplinkStatus::Idle;
+        app.lastLoraErr = 0;
+        app.lastUplinkOkMs = 0;
+        app.sessionRestored = false;
+        app.sessionChecked = false;
+        app.joinAttempted = false;
+        app.restoreUplinkAttempts = 0;
+        app.nextRestoreUplinkMs = 0;
+      }
     }
   }
-
-  wasDown = down;
 }
 
 static void updateJoinFlow() {
@@ -528,6 +535,7 @@ static void updateJoinFlow() {
 
   if (app.joinStatus == JoinStatus::Boot) {
     app.joinStatus = JoinStatus::RadioInit;
+    return;
   }
 
   if (app.joinStatus == JoinStatus::RadioInit) {
@@ -538,6 +546,7 @@ static void updateJoinFlow() {
     } else {
       app.joinStatus = JoinStatus::JoinFail;
     }
+    return;
   }
 
   if (app.joinStatus == JoinStatus::Restoring && !app.sessionChecked) {
@@ -554,9 +563,11 @@ static void updateJoinFlow() {
     }
 
     app.joinStatus = JoinStatus::RestoreFail;
+    app.nextJoinAttemptMs = now + 400;
+    return;
   }
 
-  if ((app.joinStatus == JoinStatus::RestoreFail || app.joinStatus == JoinStatus::Joining) && !app.joined) {
+  if (app.joinStatus == JoinStatus::RestoreFail && !app.joined) {
     if (app.joinAttempted) {
       app.joinStatus = JoinStatus::JoinFail;
       return;
@@ -564,8 +575,16 @@ static void updateJoinFlow() {
 
     if (now < app.nextJoinAttemptMs) return;
 
-    app.joinAttempted = true;
     app.joinStatus = JoinStatus::Joining;
+    app.nextJoinAttemptMs = now + 1;
+    return;
+  }
+
+  if (app.joinStatus == JoinStatus::Joining && !app.joined) {
+    if (app.joinAttempted) return;
+    if (now < app.nextJoinAttemptMs) return;
+
+    app.joinAttempted = true;
     bool ok = lorawanManager.join(app);
     if (ok) {
       app.joined = true;
@@ -578,6 +597,7 @@ static void updateJoinFlow() {
       app.lastUplinkOkMs = 0;
       app.joinStatus = JoinStatus::JoinFail;
     }
+    return;
   }
 }
 
