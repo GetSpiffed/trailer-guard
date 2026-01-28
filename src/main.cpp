@@ -23,6 +23,9 @@ static constexpr uint8_t GNSS_RX_PIN = 8;
 static constexpr uint8_t GNSS_TX_PIN = 9;
 static constexpr uint32_t GNSS_BAUD = 9600;
 
+// ---------------- BOOT button ----------------
+static constexpr uint8_t BOOT_PIN = 0; // Button1 (BOOT)
+
 // ---------------- LoRaWAN keys (TTN) ----------------
 static const uint64_t JOIN_EUI = 0x0000000000000000ULL;
 static const uint64_t DEV_EUI  = 0x70B3D57ED0075678ULL;
@@ -85,6 +88,13 @@ enum class UplinkStatus : uint8_t {
   Fail
 };
 
+// app gate state
+enum class RunGate : uint8_t {
+  WaitingForBoot,
+  Starting,
+  Running
+};
+
 struct AppState {
   JoinStatus joinStatus = JoinStatus::Boot;
   UplinkStatus uplinkStatus = UplinkStatus::Idle;
@@ -95,21 +105,70 @@ struct AppState {
   bool radioReady = false;
   bool joined = false;
   bool uplinkSent = false;
+
+  RunGate gate = RunGate::WaitingForBoot;
 };
 
 static AppState app;
 static uint32_t nextChgLedBlinkMs = 0;
 static uint32_t chgLedPulseEndMs = 0;
 
+// ---------- PMU helpers ----------
 static void setChgLed(bool on) {
   axp.setChargingLedMode(on ? XPOWERS_CHG_LED_ON : XPOWERS_CHG_LED_OFF);
 }
 
-static uint16_t readBatteryMv() {
-  if (axp.isBatteryConnect()) {
-    return (uint16_t)axp.getBattVoltage(); // mV bij veel XPowersLib builds
+static int chargerStatusRaw() {
+  // meestal: 0=not charging, 1=charging, 2=done
+  return axp.getChargerStatus();
+}
+
+static const char* chargerStatusText(int st) {
+  switch (st) {
+    case 0: return "NO";
+    case 1: return "CHG";
+    case 2: return "DONE";
+    default: return "?";
   }
-  return 0;
+}
+
+// LED constant aan bij CHG of DONE (USB eraan + klaar) om te zien dat USB "leeft"
+static bool isChargingOrDone() {
+  int st = chargerStatusRaw();
+  return (st == 1) || (st == 2);
+}
+
+static uint16_t readBatteryMv() {
+  if (!axp.isBatteryConnect()) return 0;
+
+  // XPowersLib builds verschillen: soms V, soms mV, soms 10mV units
+  float v = axp.getBattVoltage();
+
+  if (v > 0 && v < 10.0f) {
+    return (uint16_t)lroundf(v * 1000.0f);   // V -> mV
+  } else if (v >= 10.0f && v < 1000.0f) {
+    return (uint16_t)lroundf(v * 10.0f);     // 10mV units -> mV
+  } else {
+    return (uint16_t)lroundf(v);             // al mV
+  }
+}
+
+// VBUS / USB detect + VBUS spanning
+static bool hasVbus() {
+  return axp.isVbusIn();
+}
+
+static uint16_t readVbusMv() {
+  float v = axp.getVbusVoltage();
+  if (v > 0 && v < 10.0f) return (uint16_t)lroundf(v * 1000.0f);
+  return (uint16_t)lroundf(v);
+}
+
+// Battery current: probeer charge current. Als dit bij jou niet compilet,
+// vervang deze ene regel door een methode die wél bestaat in jouw XPowersLib build.
+static uint8_t readBatteryPercent() {
+  if (!axp.isBatteryConnect()) return 0;
+  return (uint8_t)axp.getBatteryPercent();
 }
 
 // ---- PowerManager (AXP2101) ----
@@ -117,9 +176,7 @@ struct PowerManager {
   bool begin() {
     I2C_PMU.begin(PMU_SDA, PMU_SCL);
     bool ok = axp.begin(I2C_PMU, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL);
-    if (!ok) {
-      return false;
-    }
+    if (!ok) return false;
 
     axp.setALDO1Voltage(3300);
     axp.enableALDO1();
@@ -131,7 +188,6 @@ struct PowerManager {
     axp.setALDO4Voltage(3300);
     axp.enableALDO4();
 
-	setChgLed(false);
     return true;
   }
 };
@@ -145,50 +201,50 @@ struct DisplayManager {
 
   static const char* joinStatusText(JoinStatus status) {
     switch (status) {
-      case JoinStatus::Boot:
-        return "BOOT";
-      case JoinStatus::RadioInit:
-        return "RADIO INIT";
-      case JoinStatus::Joining:
-        return "JOINING...";
-      case JoinStatus::JoinOk:
-        return "JOIN OK";
-      case JoinStatus::JoinFail:
-        return "JOIN FAIL";
-      default:
-        return "";
+      case JoinStatus::Boot:      return "BOOT";
+      case JoinStatus::RadioInit: return "RADIO INIT";
+      case JoinStatus::Joining:   return "JOINING...";
+      case JoinStatus::JoinOk:    return "JOIN OK";
+      case JoinStatus::JoinFail:  return "JOIN FAIL";
+      default:                    return "";
     }
   }
 
-  void render(const AppState& state, TinyGPSPlus& gps) {
+  // Titelregel opgeofferd; we gebruiken 2 regels voor power debug
+  void render(const AppState& state, TinyGPSPlus& gps,
+            uint16_t battMv, uint8_t battPct,
+            int chgRaw, bool vbus, uint16_t vbusMv) {
+
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x10_tf);
 
-    u8g2.drawStr(0, 10, "LORAWAN JOIN TEST");
-
+    // 1 regel: "BAT 3875mV 82%"
     char line[32];
-    snprintf(line, sizeof(line), "JOIN: %s", joinStatusText(state.joinStatus));
-    u8g2.drawStr(0, 22, line);
+    snprintf(line, sizeof(line), "BAT %umV %u%%",
+             (unsigned)battMv,
+             (unsigned)battPct);
+    u8g2.drawStr(0, 12, line);
 
-    snprintf(line, sizeof(line), "ERR: %d", (int)state.lastLoraErr);
+
+    // gate screen
+    if (state.gate != RunGate::Running) {
+      u8g2.drawStr(0, 40, "Press BOOT to start");
+      u8g2.drawStr(0, 58, "(short press)");
+      u8g2.sendBuffer();
+      return;
+    }
+
+    snprintf(line, sizeof(line), "JOIN:%s", joinStatusText(state.joinStatus));
     u8g2.drawStr(0, 34, line);
 
-    if (state.lastUplinkOkMs == 0) {
-      snprintf(line, sizeof(line), "UPLINK: -");
-    } else {
-      uint32_t ageS = (millis() - state.lastUplinkOkMs) / 1000;
-      snprintf(line, sizeof(line), "UPLINK: OK %lus", (unsigned long)ageS);
-    }
-    if (state.uplinkStatus == UplinkStatus::Fail) {
-      snprintf(line, sizeof(line), "UPLINK: FAIL");
-    }
+    snprintf(line, sizeof(line), "ERR:%d", (int)state.lastLoraErr);
     u8g2.drawStr(0, 46, line);
 
     int sat = gps.satellites.isValid() ? gps.satellites.value() : 0;
     if (gps.location.isValid()) {
-      snprintf(line, sizeof(line), "GPS: FIX (%d)", sat);
+      snprintf(line, sizeof(line), "GPS:FIX(%d)", sat);
     } else {
-      snprintf(line, sizeof(line), "GPS: NO FIX (%d)", sat);
+      snprintf(line, sizeof(line), "GPS:NO(%d)", sat);
     }
     u8g2.drawStr(0, 58, line);
 
@@ -255,9 +311,7 @@ struct LoRaWanManager {
   void sendOnce(AppState& state) {
     uint8_t payload[16];
     size_t n = buildPayload(payload, sizeof(payload));
-    if (n == 0) {
-      return;
-    }
+    if (n == 0) return;
 
     int16_t st = node.sendReceive(payload, n, LORAWAN_FPORT);
     state.lastLoraErr = st;
@@ -271,14 +325,10 @@ struct LoRaWanManager {
   }
 };
 
-
-
 static PowerManager powerManager;
 static DisplayManager displayManager;
 static GnssManager gnssManager;
 static LoRaWanManager lorawanManager;
-
-
 
 // payload: 13 bytes
 static size_t buildPayload(uint8_t* out, size_t maxLen) {
@@ -330,6 +380,45 @@ static void disableRadios() {
   btStop();
 }
 
+// gate state machine (short press)
+static void updateStartGate() {
+  static bool inited = false;
+  static bool wasDown = false;
+  static uint32_t downMs = 0;
+
+  if (!inited) {
+    pinMode(BOOT_PIN, INPUT_PULLUP);
+    inited = true;
+  }
+
+  if (app.gate == RunGate::Running) return;
+
+  bool down = (digitalRead(BOOT_PIN) == LOW); // actief-low
+
+  // detecteer "net ingedrukt"
+  if (down && !wasDown) {
+    downMs = millis();
+  }
+
+  // detecteer "net losgelaten" + debounce/short press
+  if (!down && wasDown) {
+    if (millis() - downMs >= 30) {
+      app.gate = RunGate::Running;
+
+      app.joinStatus = JoinStatus::Boot;
+      app.nextJoinAttemptMs = millis();
+      app.joinAttempts = 0;
+      app.joined = false;
+      app.uplinkSent = false;
+      app.uplinkStatus = UplinkStatus::Idle;
+      app.lastLoraErr = 0;
+      app.lastUplinkOkMs = 0;
+    }
+  }
+
+  wasDown = down;
+}
+
 static void updateJoinFlow() {
   uint32_t now = millis();
 
@@ -353,9 +442,7 @@ static void updateJoinFlow() {
       return;
     }
 
-    if (now < app.nextJoinAttemptMs) {
-      return;
-    }
+    if (now < app.nextJoinAttemptMs) return;
 
     app.joinAttempts++;
     bool ok = lorawanManager.join(app);
@@ -373,27 +460,29 @@ static void updateJoinFlow() {
 }
 
 static void updateUplinkFlow() {
-  if (!app.joined || app.uplinkSent) {
-    return;
-  }
-
+  if (!app.joined || app.uplinkSent) return;
   lorawanManager.sendOnce(app);
   app.uplinkSent = true;
-
-  // TODO: schedule deep sleep after uplink.
-  // TODO: add daily heartbeat uplink when no motion.
 }
 
 static void updateChgLed() {
-  if (!app.joined) {
-    if (nextChgLedBlinkMs != 0 || chgLedPulseEndMs != 0) {
-      setChgLed(false);
-      nextChgLedBlinkMs = 0;
-      chgLedPulseEndMs = 0;
-    }
+  // constant aan als PMU CHG of DONE ziet (USB eraan)
+  if (isChargingOrDone()) {
+    setChgLed(true);
+    nextChgLedBlinkMs = 0;
+    chgLedPulseEndMs = 0;
     return;
   }
 
+  // niet laden/geen USB (of status NO)
+  if (!app.joined) {
+    setChgLed(false);
+    nextChgLedBlinkMs = 0;
+    chgLedPulseEndMs = 0;
+    return;
+  }
+
+  // na join: pulse
   uint32_t now = millis();
 
   if (nextChgLedBlinkMs == 0) {
@@ -412,12 +501,14 @@ static void updateChgLed() {
   }
 }
 
-
 void setup() {
   powerManager.begin();
   displayManager.begin();
   gnssManager.begin();
   disableRadios();
+
+  app.gate = RunGate::WaitingForBoot;
+  pinMode(BOOT_PIN, INPUT_PULLUP);
 
   app.joinStatus = JoinStatus::Boot;
   app.nextJoinAttemptMs = millis();
@@ -425,15 +516,27 @@ void setup() {
 
 void loop() {
   gnssManager.update();
-  updateJoinFlow();
-  updateUplinkFlow();
+
+  updateStartGate();
+
+  if (app.gate == RunGate::Running) {
+    updateJoinFlow();
+    updateUplinkFlow();
+  }
+
   updateChgLed();
 
   uint32_t now = millis();
-  if (now - lastDrawMs >= 1000) {
+  if (now - lastDrawMs >= 250) {
     lastDrawMs = now;
-    displayManager.render(app, gps);
-  }
 
-  // TODO: add wake-on-motion trigger and related state transitions.
+    uint16_t battMv = readBatteryMv();
+    int chgRaw = chargerStatusRaw();
+
+    bool vbus = hasVbus();
+    uint16_t vbusMv = readVbusMv();
+
+    uint8_t battPct = readBatteryPercent();
+    displayManager.render(app, gps, battMv, battPct, chgRaw, vbus, vbusMv);
+  }
 }

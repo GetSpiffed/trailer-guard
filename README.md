@@ -16,3 +16,6 @@ GPS anti-diefstal tracker op basis van LilyGO T-Beam-S3 Supreme (ESP32-S3).
 - [ ] GPS fix + parsing
 - [ ] LoRa payload
 - [ ] Home Assistant integratie
+
+## documentation
+https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_supreme/t_beam_supreme_hw.md
