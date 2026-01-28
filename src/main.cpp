@@ -54,6 +54,8 @@ static constexpr int LORA_BUSY = 4;
 static constexpr uint8_t  LORAWAN_FPORT   = 1;
 static constexpr uint8_t  JOIN_MAX_TRIES  = 3;
 static constexpr uint32_t JOIN_RETRY_MS   = 20000;
+static constexpr uint32_t CHG_LED_INTERVAL_MS = 30000;
+static constexpr uint32_t CHG_LED_PULSE_MS = 120;
 
 // ---------------- Globals ----------------
 XPowersAXP2101 axp;
@@ -96,6 +98,12 @@ struct AppState {
 };
 
 static AppState app;
+static uint32_t nextChgLedBlinkMs = 0;
+static uint32_t chgLedPulseEndMs = 0;
+
+static void setChgLed(bool on) {
+  axp.setChargingLedMode(on ? XPOWERS_CHG_LED_ON : XPOWERS_CHG_LED_OFF);
+}
 
 static uint16_t readBatteryMv() {
   if (axp.isBatteryConnect()) {
@@ -123,6 +131,7 @@ struct PowerManager {
     axp.setALDO4Voltage(3300);
     axp.enableALDO4();
 
+	setChgLed(false);
     return true;
   }
 };
@@ -369,6 +378,35 @@ static void updateUplinkFlow() {
   // TODO: add daily heartbeat uplink when no motion.
 }
 
+static void updateChgLed() {
+  if (!app.joined) {
+    if (nextChgLedBlinkMs != 0 || chgLedPulseEndMs != 0) {
+      setChgLed(false);
+      nextChgLedBlinkMs = 0;
+      chgLedPulseEndMs = 0;
+    }
+    return;
+  }
+
+  uint32_t now = millis();
+
+  if (nextChgLedBlinkMs == 0) {
+    nextChgLedBlinkMs = now + CHG_LED_INTERVAL_MS;
+  }
+
+  if (chgLedPulseEndMs != 0 && now >= chgLedPulseEndMs) {
+    setChgLed(false);
+    chgLedPulseEndMs = 0;
+  }
+
+  if (now >= nextChgLedBlinkMs) {
+    setChgLed(true);
+    chgLedPulseEndMs = now + CHG_LED_PULSE_MS;
+    nextChgLedBlinkMs = now + CHG_LED_INTERVAL_MS;
+  }
+}
+
+
 void setup() {
   powerManager.begin();
   displayManager.begin();
@@ -383,6 +421,7 @@ void loop() {
   gnssManager.update();
   updateJoinFlow();
   updateUplinkFlow();
+  updateChgLed();
 
   uint32_t now = millis();
   if (now - lastDrawMs >= 1000) {
