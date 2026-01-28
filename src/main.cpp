@@ -6,8 +6,6 @@
 #include <WiFi.h>
 #include <esp_bt.h>
 
-
-
 #include <SPI.h>
 #include <RadioLib.h>
 
@@ -53,8 +51,9 @@ static constexpr int LORA_DIO1 = 1;
 static constexpr int LORA_BUSY = 4;
 
 // ---------------- App settings ----------------
-static constexpr uint32_t UPLINK_EVERY_MS = 60000;   // 60s voor testen
 static constexpr uint8_t  LORAWAN_FPORT   = 1;
+static constexpr uint8_t  JOIN_MAX_TRIES  = 3;
+static constexpr uint32_t JOIN_RETRY_MS   = 20000;
 
 // ---------------- Globals ----------------
 XPowersAXP2101 axp;
@@ -65,21 +64,38 @@ TinyGPSPlus gps;
 U8G2_SH1106_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, DEV_SCL, DEV_SDA, U8X8_PIN_NONE);
 
 uint32_t lastDrawMs = 0;
-uint32_t lastUplinkMs = 0;
 
 // ---------------- LoRaWAN (RadioLib) ----------------
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 LoRaWANNode node(&radio, &EU868);
 
-// --- TTN OLED STATUS ---
-bool lorawanJoined = false;
-int16_t lastLoraErr = 0;            // 0 = OK
-uint32_t lastUplinkOkMs = 0;        // millis() laatste OK uplink
-// --- end TTN OLED STATUS ---
+enum class JoinStatus : uint8_t {
+  Boot,
+  RadioInit,
+  Joining,
+  JoinOk,
+  JoinFail
+};
 
-static void logRadioErr(const char* where, int16_t err) {
-  Serial.printf("[LoRaWAN] %s failed, code=%d\n", where, err);
-}
+enum class UplinkStatus : uint8_t {
+  Idle,
+  Ok,
+  Fail
+};
+
+struct AppState {
+  JoinStatus joinStatus = JoinStatus::Boot;
+  UplinkStatus uplinkStatus = UplinkStatus::Idle;
+  int16_t lastLoraErr = 0;
+  uint32_t lastUplinkOkMs = 0;
+  uint32_t nextJoinAttemptMs = 0;
+  uint8_t joinAttempts = 0;
+  bool radioReady = false;
+  bool joined = false;
+  bool uplinkSent = false;
+};
+
+static AppState app;
 
 static uint16_t readBatteryMv() {
   if (axp.isBatteryConnect()) {
@@ -88,34 +104,166 @@ static uint16_t readBatteryMv() {
   return 0;
 }
 
-static bool radioInited = false;
+// ---- PowerManager (AXP2101) ----
+struct PowerManager {
+  bool begin() {
+    I2C_PMU.begin(PMU_SDA, PMU_SCL);
+    bool ok = axp.begin(I2C_PMU, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL);
+    if (!ok) {
+      return false;
+    }
 
-static bool initRadioOnce() {
-  if (radioInited) return true;
+    axp.setALDO1Voltage(3300);
+    axp.enableALDO1();
 
-  Serial.println("[LoRaWAN] SPI begin...");
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+    axp.setALDO3Voltage(3300);
+    axp.enableALDO3();
+    delay(50);
 
-  Serial.println("[LoRaWAN] radio reset...");
-  pinMode(LORA_RST, OUTPUT);
-  digitalWrite(LORA_RST, LOW);  delay(10);
-  digitalWrite(LORA_RST, HIGH); delay(10);
+    axp.setALDO4Voltage(3300);
+    axp.enableALDO4();
 
-  Serial.println("[LoRaWAN] radio begin...");
-  int16_t st = radio.begin();
-  if (st != RADIOLIB_ERR_NONE) {
-    lastLoraErr = st;
-    logRadioErr("radio.begin", st);
-    return false;
+    return true;
+  }
+};
+
+// ---- DisplayManager (OLED) ----
+struct DisplayManager {
+  void begin() {
+    u8g2.begin();
+    u8g2.setFont(u8g2_font_6x10_tf);
   }
 
-  radio.setDio2AsRfSwitch(true);
-  radio.setOutputPower(14);
-  radio.setCurrentLimit(140);
+  static const char* joinStatusText(JoinStatus status) {
+    switch (status) {
+      case JoinStatus::Boot:
+        return "BOOT";
+      case JoinStatus::RadioInit:
+        return "RADIO INIT";
+      case JoinStatus::Joining:
+        return "JOINING...";
+      case JoinStatus::JoinOk:
+        return "JOIN OK";
+      case JoinStatus::JoinFail:
+        return "JOIN FAIL";
+      default:
+        return "";
+    }
+  }
 
-  radioInited = true;
-  return true;
-}
+  void render(const AppState& state, const TinyGPSPlus& gps) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+
+    u8g2.drawStr(0, 10, "LORAWAN JOIN TEST");
+
+    char line[32];
+    snprintf(line, sizeof(line), "JOIN: %s", joinStatusText(state.joinStatus));
+    u8g2.drawStr(0, 22, line);
+
+    snprintf(line, sizeof(line), "ERR: %d", (int)state.lastLoraErr);
+    u8g2.drawStr(0, 34, line);
+
+    if (state.lastUplinkOkMs == 0) {
+      snprintf(line, sizeof(line), "UPLINK: -");
+    } else {
+      uint32_t ageS = (millis() - state.lastUplinkOkMs) / 1000;
+      snprintf(line, sizeof(line), "UPLINK: OK %lus", (unsigned long)ageS);
+    }
+    if (state.uplinkStatus == UplinkStatus::Fail) {
+      snprintf(line, sizeof(line), "UPLINK: FAIL");
+    }
+    u8g2.drawStr(0, 46, line);
+
+    int sat = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    if (gps.location.isValid()) {
+      snprintf(line, sizeof(line), "GPS: FIX (%d)", sat);
+    } else {
+      snprintf(line, sizeof(line), "GPS: NO FIX (%d)", sat);
+    }
+    u8g2.drawStr(0, 58, line);
+
+    u8g2.sendBuffer();
+  }
+};
+
+// ---- GNSS Manager ----
+struct GnssManager {
+  void begin() {
+    GNSS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
+  }
+
+  void update() {
+    while (GNSS.available()) {
+      gps.encode((char)GNSS.read());
+    }
+  }
+};
+
+// ---- LoRaWAN Manager ----
+struct LoRaWanManager {
+  bool initRadio(AppState& state) {
+    SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+
+    pinMode(LORA_RST, OUTPUT);
+    digitalWrite(LORA_RST, LOW);
+    delay(10);
+    digitalWrite(LORA_RST, HIGH);
+    delay(10);
+
+    int16_t st = radio.begin();
+    if (st != RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = st;
+      return false;
+    }
+
+    radio.setDio2AsRfSwitch(true);
+    radio.setOutputPower(14);
+    radio.setCurrentLimit(140);
+    state.lastLoraErr = 0;
+    return true;
+  }
+
+  bool join(AppState& state) {
+    int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
+    if (st != RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = st;
+      return false;
+    }
+
+    st = node.activateOTAA();
+    if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
+      state.lastLoraErr = st;
+      return false;
+    }
+
+    state.lastLoraErr = 0;
+    return true;
+  }
+
+  void sendOnce(AppState& state) {
+    uint8_t payload[16];
+    size_t n = buildPayload(payload, sizeof(payload));
+    if (n == 0) {
+      return;
+    }
+
+    int16_t st = node.sendReceive(payload, n, LORAWAN_FPORT);
+    state.lastLoraErr = st;
+    if (st == RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = 0;
+      state.lastUplinkOkMs = millis();
+      state.uplinkStatus = UplinkStatus::Ok;
+    } else {
+      state.uplinkStatus = UplinkStatus::Fail;
+    }
+  }
+};
+
+static PowerManager powerManager;
+static DisplayManager displayManager;
+static GnssManager gnssManager;
+static LoRaWanManager lorawanManager;
 
 // payload: 13 bytes
 static size_t buildPayload(uint8_t* out, size_t maxLen) {
@@ -161,196 +309,86 @@ static size_t buildPayload(uint8_t* out, size_t maxLen) {
   return 13;
 }
 
-static bool lorawanJoin() {
-  if (!initRadioOnce()) return false;
-
-  Serial.println("[LoRaWAN] begin OTAA...");
-  int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
-  if (st != RADIOLIB_ERR_NONE) {
-    lastLoraErr = st;
-    logRadioErr("node.beginOTAA", st);
-    return false;
-  }
-
-  Serial.println("[LoRaWAN] activate OTAA (join)...");
-  st = node.activateOTAA();
-  if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
-    lastLoraErr = st;
-    logRadioErr("node.activateOTAA", st);
-    return false;
-  }
-
-  lastLoraErr = 0;
-  Serial.println("[LoRaWAN] joined OK");
-  return true;
+// ---- App State / Flow ----
+static void disableRadios() {
+  WiFi.mode(WIFI_OFF);
+  btStop();
 }
 
-static bool lorawanJoinWithRetry(uint8_t tries = 3, uint32_t pauseMs = 10000) {
-  for (uint8_t i = 0; i < tries; i++) {
-    Serial.printf("[LoRaWAN] join attempt %u/%u\n", (unsigned)(i + 1), (unsigned)tries);
+static void updateJoinFlow() {
+  uint32_t now = millis();
 
-    if (lorawanJoin()) return true;
-
-    // OLED: join is niet gelukt, dus "OK-age" resetten
-    lastUplinkOkMs = 0;
-
-    delay(pauseMs);
+  if (app.joinStatus == JoinStatus::Boot) {
+    app.joinStatus = JoinStatus::RadioInit;
   }
-  return false;
-}
 
-static void lorawanSendOnce() {
-  uint8_t payload[16];
-  size_t n = buildPayload(payload, sizeof(payload));
-  if (n == 0) return;
+  if (app.joinStatus == JoinStatus::RadioInit) {
+    app.radioReady = lorawanManager.initRadio(app);
+    if (app.radioReady) {
+      app.joinStatus = JoinStatus::Joining;
+      app.nextJoinAttemptMs = now;
+    } else {
+      app.joinStatus = JoinStatus::JoinFail;
+    }
+  }
 
-  Serial.printf("[LoRaWAN] uplink (%u bytes) ...\n", (unsigned)n);
-  int16_t st = node.sendReceive(payload, n, LORAWAN_FPORT);
+  if (app.joinStatus == JoinStatus::Joining) {
+    if (app.joinAttempts >= JOIN_MAX_TRIES) {
+      app.joinStatus = JoinStatus::JoinFail;
+      return;
+    }
 
-  lastLoraErr = st;
-  if (st == RADIOLIB_ERR_NONE) {
-    lastLoraErr = 0;
-    lastUplinkOkMs = millis();
-    Serial.println("[LoRaWAN] uplink OK");
-  } else {
-    logRadioErr("node.sendReceive", st);
+    if (now < app.nextJoinAttemptMs) {
+      return;
+    }
+
+    app.joinAttempts++;
+    bool ok = lorawanManager.join(app);
+    if (ok) {
+      app.joined = true;
+      app.joinStatus = JoinStatus::JoinOk;
+    } else {
+      app.lastUplinkOkMs = 0;
+      app.nextJoinAttemptMs = now + JOIN_RETRY_MS;
+      if (app.joinAttempts >= JOIN_MAX_TRIES) {
+        app.joinStatus = JoinStatus::JoinFail;
+      }
+    }
   }
 }
 
-// --- TTN OLED STATUS ---
-static void buildTtnStatusLine(char* out, size_t outLen) {
-  if (!lorawanJoined) {
-    snprintf(out, outLen, "TTN:NOJOIN");
+static void updateUplinkFlow() {
+  if (!app.joined || app.uplinkSent) {
     return;
   }
-  if (lastLoraErr != 0) {
-    snprintf(out, outLen, "TTN:ERR%d", (int)lastLoraErr);
-    return;
-  }
-  if (lastUplinkOkMs == 0) {
-    snprintf(out, outLen, "TTN:JOIN");
-    return;
-  }
-  uint32_t ageS = (millis() - lastUplinkOkMs) / 1000;
-  if (ageS > 9999) ageS = 9999;
-  snprintf(out, outLen, "TTN:OK %lus", (unsigned long)ageS);
-}
-// --- end TTN OLED STATUS ---
 
-void drawScreen() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
+  lorawanManager.sendOnce(app);
+  app.uplinkSent = true;
 
-  u8g2.drawStr(0, 10, "lora-trailer-guard-001");
-  u8g2.drawHLine(0, 12, 128);
-
-  char line[32];
-  int sat = gps.satellites.isValid() ? gps.satellites.value() : 0;
-
-  snprintf(line, sizeof(line), "SAT: %d", sat);
-  u8g2.drawStr(0, 26, line);
-
-  if (gps.location.isValid()) {
-    double lat = gps.location.lat();
-    double lon = gps.location.lng();
-
-    snprintf(line, sizeof(line), "LAT: %.6f", lat);
-    u8g2.drawStr(0, 40, line);
-
-    snprintf(line, sizeof(line), "LON: %.6f", lon);
-    u8g2.drawStr(0, 54, line);
-  } else {
-    u8g2.drawStr(0, 44, "GPS: NO FIX (indoor ok)");
-  }
-
-  char ttnLine[24];
-  buildTtnStatusLine(ttnLine, sizeof(ttnLine));
-  u8g2.drawStr(0, 62, ttnLine);
-
-  u8g2.sendBuffer();
+  // TODO: schedule deep sleep after uplink.
+  // TODO: add daily heartbeat uplink when no motion.
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(800);
-  Serial.println("boot ok");
+  powerManager.begin();
+  displayManager.begin();
+  gnssManager.begin();
+  disableRadios();
 
-  // Init PMU
-  I2C_PMU.begin(PMU_SDA, PMU_SCL);
-  bool pmuOk = axp.begin(I2C_PMU, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL);
-
-  if (pmuOk) {
-    Serial.println("AXP ok, enabling ALDO1 (OLED) + ALDO3 (LoRa) + ALDO4 (GNSS)");
-
-    axp.setALDO1Voltage(3300);
-    axp.enableALDO1();
-
-    axp.setALDO3Voltage(3300);   // SX1262 radio
-    axp.enableALDO3();
-    delay(50);                   // radio power settle
-
-    axp.setALDO4Voltage(3300);
-    axp.enableALDO4();
-  } else {
-    Serial.println("AXP init failed");
-  }
-
-  delay(200);
-
-  // OLED init
-  u8g2.begin();
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 20, "OLED: init ok");
-  u8g2.drawStr(0, 36, "Starting GNSS...");
-  u8g2.sendBuffer();
-
-  // GNSS serial init
-  GNSS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
-  Serial.println("GNSS UART started");
-
-  WiFi.mode(WIFI_OFF);
-  btStop();
-  delay(100);
-
-
-  // LoRaWAN join (retry + backoff)
-  lorawanJoined = lorawanJoinWithRetry(3, 20000);
-
-  if (!lorawanJoined) {
-    Serial.println("[LoRaWAN] join failed after retries (check TTN events / coverage)");
-    // lastLoraErr bevat al de echte foutcode (meestal -1116)
-  } else {
-    lastLoraErr = 0;
-    Serial.println("[LoRaWAN] joined OK (after retry loop)");
-  }
-
-  lastUplinkMs = millis();
+  app.joinStatus = JoinStatus::Boot;
+  app.nextJoinAttemptMs = millis();
 }
 
 void loop() {
-  while (GNSS.available()) {
-    gps.encode((char)GNSS.read());
-  }
+  gnssManager.update();
+  updateJoinFlow();
+  updateUplinkFlow();
 
   uint32_t now = millis();
-
   if (now - lastDrawMs >= 1000) {
     lastDrawMs = now;
-
-    int sat = gps.satellites.isValid() ? gps.satellites.value() : 0;
-    if (gps.location.isValid()) {
-      Serial.printf("FIX lat=%.6f lon=%.6f sat=%d\n",
-                    gps.location.lat(), gps.location.lng(), sat);
-    } else {
-      Serial.printf("no fix, sat=%d\n", sat);
-    }
-
-    drawScreen();
+    displayManager.render(app, gps);
   }
 
-  if (lorawanJoined && (now - lastUplinkMs >= UPLINK_EVERY_MS)) {
-    lastUplinkMs = now;
-    lorawanSendOnce();
-  }
+  // TODO: add wake-on-motion trigger and related state transitions.
 }
