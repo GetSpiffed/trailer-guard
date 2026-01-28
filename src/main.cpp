@@ -8,6 +8,7 @@
 
 #include <SPI.h>
 #include <RadioLib.h>
+#include <Preferences.h>
 
 // ---------------- PMU bus ----------------
 TwoWire I2C_PMU(0);
@@ -55,10 +56,10 @@ static constexpr int LORA_BUSY = 4;
 
 // ---------------- App settings ----------------
 static constexpr uint8_t  LORAWAN_FPORT   = 1;
-static constexpr uint8_t  JOIN_MAX_TRIES  = 3;
-static constexpr uint32_t JOIN_RETRY_MS   = 20000;
 static constexpr uint32_t CHG_LED_INTERVAL_MS = 30000;
 static constexpr uint32_t CHG_LED_PULSE_MS = 120;
+static constexpr uint8_t  RESTORE_UPLINK_MAX_TRIES = 2;
+static constexpr uint32_t RESTORE_UPLINK_RETRY_MS = 8000;
 
 // ---------------- Globals ----------------
 XPowersAXP2101 axp;
@@ -77,6 +78,9 @@ LoRaWANNode node(&radio, &EU868);
 enum class JoinStatus : uint8_t {
   Boot,
   RadioInit,
+  Restoring,
+  RestoreOk,
+  RestoreFail,
   Joining,
   JoinOk,
   JoinFail
@@ -101,10 +105,14 @@ struct AppState {
   int16_t lastLoraErr = 0;
   uint32_t lastUplinkOkMs = 0;
   uint32_t nextJoinAttemptMs = 0;
-  uint8_t joinAttempts = 0;
   bool radioReady = false;
   bool joined = false;
   bool uplinkSent = false;
+  bool sessionRestored = false;
+  bool sessionChecked = false;
+  bool joinAttempted = false;
+  uint8_t restoreUplinkAttempts = 0;
+  uint32_t nextRestoreUplinkMs = 0;
 
   RunGate gate = RunGate::WaitingForBoot;
 };
@@ -203,6 +211,9 @@ struct DisplayManager {
     switch (status) {
       case JoinStatus::Boot:      return "BOOT";
       case JoinStatus::RadioInit: return "RADIO INIT";
+      case JoinStatus::Restoring: return "RESTORING";
+      case JoinStatus::RestoreOk: return "RESTORE OK";
+      case JoinStatus::RestoreFail: return "RESTORE FAIL";
       case JoinStatus::Joining:   return "JOINING...";
       case JoinStatus::JoinOk:    return "JOIN OK";
       case JoinStatus::JoinFail:  return "JOIN FAIL";
@@ -269,6 +280,37 @@ static size_t buildPayload(uint8_t* out, size_t maxLen);
 
 // ---- LoRaWAN Manager ----
 struct LoRaWanManager {
+  static bool loadSession(LoRaWANSession_t& session) {
+    Preferences prefs;
+    if (!prefs.begin("lorawan", true)) return false;
+    bool valid = prefs.getBool("valid", false);
+    size_t len = prefs.getBytesLength("session");
+    if (!valid || len != sizeof(session)) {
+      prefs.end();
+      return false;
+    }
+    size_t read = prefs.getBytes("session", &session, sizeof(session));
+    prefs.end();
+    return read == sizeof(session);
+  }
+
+  static bool saveSession(const LoRaWANSession_t& session) {
+    Preferences prefs;
+    if (!prefs.begin("lorawan", false)) return false;
+    prefs.putBool("valid", true);
+    size_t written = prefs.putBytes("session", &session, sizeof(session));
+    prefs.end();
+    return written == sizeof(session);
+  }
+
+  static void clearSession() {
+    Preferences prefs;
+    if (!prefs.begin("lorawan", false)) return;
+    prefs.remove("valid");
+    prefs.remove("session");
+    prefs.end();
+  }
+
   bool initRadio(AppState& state) {
     SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
 
@@ -291,6 +333,16 @@ struct LoRaWanManager {
     return true;
   }
 
+  bool restoreSession(AppState& state, const LoRaWANSession_t& session) {
+    int16_t st = node.setSession(&session);
+    if (st != RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = st;
+      return false;
+    }
+    state.lastLoraErr = 0;
+    return true;
+  }
+
   bool join(AppState& state) {
     int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
     if (st != RADIOLIB_ERR_NONE) {
@@ -304,6 +356,16 @@ struct LoRaWanManager {
       return false;
     }
 
+    state.lastLoraErr = 0;
+    return true;
+  }
+
+  bool fetchSession(AppState& state, LoRaWANSession_t& session) {
+    int16_t st = node.getSession(&session);
+    if (st != RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = st;
+      return false;
+    }
     state.lastLoraErr = 0;
     return true;
   }
@@ -407,12 +469,16 @@ static void updateStartGate() {
 
       app.joinStatus = JoinStatus::Boot;
       app.nextJoinAttemptMs = millis();
-      app.joinAttempts = 0;
       app.joined = false;
       app.uplinkSent = false;
       app.uplinkStatus = UplinkStatus::Idle;
       app.lastLoraErr = 0;
       app.lastUplinkOkMs = 0;
+      app.sessionRestored = false;
+      app.sessionChecked = false;
+      app.joinAttempted = false;
+      app.restoreUplinkAttempts = 0;
+      app.nextRestoreUplinkMs = 0;
     }
   }
 
@@ -429,40 +495,116 @@ static void updateJoinFlow() {
   if (app.joinStatus == JoinStatus::RadioInit) {
     app.radioReady = lorawanManager.initRadio(app);
     if (app.radioReady) {
-      app.joinStatus = JoinStatus::Joining;
+      app.joinStatus = JoinStatus::Restoring;
       app.nextJoinAttemptMs = now;
     } else {
       app.joinStatus = JoinStatus::JoinFail;
     }
   }
 
-  if (app.joinStatus == JoinStatus::Joining) {
-    if (app.joinAttempts >= JOIN_MAX_TRIES) {
+  if (app.joinStatus == JoinStatus::Restoring && !app.sessionChecked) {
+    app.sessionChecked = true;
+    LoRaWANSession_t session;
+    bool haveSession = lorawanManager.loadSession(session);
+    if (haveSession && lorawanManager.restoreSession(app, session)) {
+      app.joined = true;
+      app.sessionRestored = true;
+      app.joinStatus = JoinStatus::RestoreOk;
+      app.restoreUplinkAttempts = 0;
+      app.nextRestoreUplinkMs = now;
+      return;
+    }
+
+    app.joinStatus = JoinStatus::RestoreFail;
+  }
+
+  if ((app.joinStatus == JoinStatus::RestoreFail || app.joinStatus == JoinStatus::Joining) && !app.joined) {
+    if (app.joinAttempted) {
       app.joinStatus = JoinStatus::JoinFail;
       return;
     }
 
     if (now < app.nextJoinAttemptMs) return;
 
-    app.joinAttempts++;
+    app.joinAttempted = true;
+    app.joinStatus = JoinStatus::Joining;
     bool ok = lorawanManager.join(app);
     if (ok) {
       app.joined = true;
       app.joinStatus = JoinStatus::JoinOk;
+      LoRaWANSession_t session;
+      if (lorawanManager.fetchSession(app, session)) {
+        lorawanManager.saveSession(session);
+      }
     } else {
       app.lastUplinkOkMs = 0;
-      app.nextJoinAttemptMs = now + JOIN_RETRY_MS;
-      if (app.joinAttempts >= JOIN_MAX_TRIES) {
-        app.joinStatus = JoinStatus::JoinFail;
-      }
+      app.joinStatus = JoinStatus::JoinFail;
     }
   }
 }
 
+static bool isSessionInvalidError(int16_t err) {
+  switch (err) {
+#ifdef RADIOLIB_ERR_MIC_MISMATCH
+    case RADIOLIB_ERR_MIC_MISMATCH:
+#endif
+#ifdef RADIOLIB_ERR_INVALID_FCNT
+    case RADIOLIB_ERR_INVALID_FCNT:
+#endif
+#ifdef RADIOLIB_ERR_DOWNLINK_MALFORMED
+    case RADIOLIB_ERR_DOWNLINK_MALFORMED:
+#endif
+      return true;
+    default:
+      return false;
+  }
+}
+
 static void updateUplinkFlow() {
-  if (!app.joined || app.uplinkSent) return;
+  if (!app.joined) return;
+
+  uint32_t now = millis();
+
+  if (app.sessionRestored) {
+    if (app.restoreUplinkAttempts >= RESTORE_UPLINK_MAX_TRIES) return;
+    if (now < app.nextRestoreUplinkMs) return;
+
+    app.restoreUplinkAttempts++;
+    lorawanManager.sendOnce(app);
+
+    if (app.uplinkStatus == UplinkStatus::Ok) {
+      app.uplinkSent = true;
+      LoRaWANSession_t session;
+      if (lorawanManager.fetchSession(app, session)) {
+        lorawanManager.saveSession(session);
+      }
+      return;
+    }
+
+    if (isSessionInvalidError(app.lastLoraErr) ||
+        app.restoreUplinkAttempts >= RESTORE_UPLINK_MAX_TRIES) {
+      lorawanManager.clearSession();
+      app.joined = false;
+      app.sessionRestored = false;
+      app.joinStatus = JoinStatus::RestoreFail;
+      app.nextJoinAttemptMs = now;
+      return;
+    }
+
+    app.nextRestoreUplinkMs = now + RESTORE_UPLINK_RETRY_MS;
+    return;
+  }
+
+  if (app.uplinkSent) return;
+
   lorawanManager.sendOnce(app);
   app.uplinkSent = true;
+  if (app.uplinkStatus == UplinkStatus::Ok) {
+    LoRaWANSession_t session;
+    if (lorawanManager.fetchSession(app, session)) {
+      lorawanManager.saveSession(session);
+    }
+  }
 }
 
 static void updateChgLed() {
