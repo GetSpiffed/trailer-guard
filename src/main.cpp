@@ -103,7 +103,8 @@ struct AppState {
 	bool radioReady = false;
 	bool joined = false;
 	bool sessionRestored = false;
-	bool forceOtaa = false;
+	uint16_t lastDevNonce = 0;
+	int16_t lastDevNonceSetErr = 0;
 };
 
 static AppState app;
@@ -300,19 +301,22 @@ struct DisplayManager {
 		u8g2.drawStr(0, 42, line);
 
 		// 4) GPS diagnostics
-		if (gpsSnap.charsPerSec == 0) {
-			snprintf(line, sizeof(line), "GPS NO UART");
-		} else {
-			const char* fixText = gpsSnap.fix ? "FIX" : "NOFIX";
-			float hdop = gpsSnap.hdop / 100.0f;
-			snprintf(line, sizeof(line), "GPS %uc/s S%u H%.1f A%lus %s",
-							 (unsigned)gpsSnap.charsPerSec,
-							 (unsigned)gpsSnap.sats,
-							 (double)hdop,
-							 (unsigned)(gpsSnap.ageMs / 1000),
-							 fixText);
-		}
+		// if (gpsSnap.charsPerSec == 0) {
+		// 	snprintf(line, sizeof(line), "GPS NO UART");
+		// } else {
+		// 	const char* fixText = gpsSnap.fix ? "FIX" : "NOFIX";
+		// 	float hdop = gpsSnap.hdop / 100.0f;
+		// 	snprintf(line, sizeof(line), "GPS %uc/s S%u H%.1f A%lus %s",
+		// 					 (unsigned)gpsSnap.charsPerSec,
+		// 					 (unsigned)gpsSnap.sats,
+		// 					 (double)hdop,
+		// 					 (unsigned)(gpsSnap.ageMs / 1000),
+		// 					 fixText);
+		// }
+		// u8g2.drawStr(0, 60, line);
+		snprintf(line, sizeof(line), "DN %u set %d", (unsigned)state.lastDevNonce, (int)state.lastDevNonceSetErr);
 		u8g2.drawStr(0, 60, line);
+
 
 		u8g2.sendBuffer();
 	}
@@ -426,6 +430,46 @@ struct LoRaWanManager {
 		return RADIOLIB_ERR_UNSUPPORTED;
 	}
 
+  // ---- DevNonce persistence (OTAA) ----
+  static uint16_t loadDevNonce() {
+    Preferences prefs;
+    if (!prefs.begin("lorawan", true)) return 0;
+    uint16_t dn = prefs.getUShort("devnonce", 0);
+    prefs.end();
+    return dn;
+  }
+
+  static void saveDevNonce(uint16_t dn) {
+    Preferences prefs;
+    if (!prefs.begin("lorawan", false)) return;
+    prefs.putUShort("devnonce", dn);
+    prefs.end();
+  }
+
+  // Try to set DevNonce on LoRaWANNode if the method exists (varies per RadioLib version)
+  template <typename NodeT>
+  static auto setNodeDevNonce(NodeT& n, uint16_t dn, int)
+      -> decltype(n.setDevNonce(dn), int16_t()) {
+    return n.setDevNonce(dn);
+  }
+
+  template <typename NodeT>
+  static auto setNodeDevNonce(NodeT& n, uint16_t dn, long)
+      -> decltype(n.setOtaaDevNonce(dn), int16_t()) {
+    return n.setOtaaDevNonce(dn);
+  }
+
+  template <typename NodeT>
+  static auto setNodeDevNonce(NodeT& n, uint16_t dn, char)
+      -> decltype(n.setOTAADevNonce(dn), int16_t()) {
+    return n.setOTAADevNonce(dn);
+  }
+
+  template <typename NodeT>
+  static int16_t setNodeDevNonce(NodeT&, uint16_t, ...) {
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
+
 
 	bool initRadio(AppState& state) {
 		SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
@@ -466,26 +510,35 @@ struct LoRaWanManager {
 	}
 
 	bool join(AppState& state) {
+		// 1) init OTAA
 		int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
 		if (st != RADIOLIB_ERR_NONE) {
 			state.lastLoraErr = st;
+			state.lastDevNonce = 0;
+			state.lastDevNonceSetErr = st;
 			return false;
 		}
 
-		// st = node.activateOTAA();
-		// if (st != RADIOLIB_LORAWAN_NEW_SESSION) {
-		//	 state.lastLoraErr = st;
-		//	 return false;
-		// }
+		// 2) DevNonce: bump + opslaan + probeer te zetten
+		uint16_t dn = loadDevNonce();
+		dn = (dn == 0xFFFF) ? 1 : (uint16_t)(dn + 1);
+		saveDevNonce(dn);
+
+		int16_t dnSt = setNodeDevNonce(node, dn, 0);
+		state.lastDevNonce = dn;
+		state.lastDevNonceSetErr = dnSt;
+
+		// 3) join
 		st = node.activateOTAA();
 		if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
 			state.lastLoraErr = st;
 			return false;
-		}	
+		}
 
 		state.lastLoraErr = RADIOLIB_ERR_NONE;
 		return true;
 	}
+
 
 	bool fetchSession(AppState& state, LoRaWANSession& session) {
 		int16_t st = getNodeSession(node, session, 0);
@@ -679,17 +732,6 @@ static void resetJoinState() {
 	app.sessionRestored = false;
 }
 
-static bool checkForceOtaaOnBoot() {
-	static constexpr uint32_t HOLD_MS = 1500;
-	pinMode(BOOT_PIN, INPUT_PULLUP);
-	if (digitalRead(BOOT_PIN) != LOW) return false;
-	uint32_t start = millis();
-	while (digitalRead(BOOT_PIN) == LOW && (millis() - start < HOLD_MS)) {
-		delay(10);
-	}
-	return (millis() - start >= HOLD_MS);
-}
-
 static void updateJoinFlow() {
 	if (app.gate != GateState::Running) return;
 
@@ -714,11 +756,6 @@ static void updateJoinFlow() {
 			break;
 		}
 		case JoinState::Restore: {
-			if (app.forceOtaa) {
-				app.joinState = JoinState::Join;
-				app.nextActionMs = now;
-				break;
-			}
 			LoRaWANSession session;
 			if (lorawanManager.loadSession(session) &&
 					lorawanManager.restoreSession(app, session)) {
@@ -829,11 +866,6 @@ void setup() {
 	displayManager.begin();
 	gnssManager.begin();
 	disableRadios();
-
-	if (checkForceOtaaOnBoot()) {
-		lorawanManager.clearSession();
-		app.forceOtaa = true;
-	}
 
 	bootGate.begin();
 	resetJoinState();
