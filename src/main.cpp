@@ -10,6 +10,8 @@
 #include <RadioLib.h>
 #include <Preferences.h>
 
+#include "secrets.h"
+
 // ---------------- PMU bus ----------------
 TwoWire I2C_PMU(0);
 static constexpr uint8_t PMU_SDA = 42;
@@ -28,24 +30,6 @@ static constexpr uint32_t GNSS_BAUD = 9600;
 
 // ---------------- BOOT button ----------------
 static constexpr uint8_t BOOT_PIN = 0; // Button1 (BOOT)
-
-// ---------------- LoRaWAN keys (TTN) ----------------
-static const uint64_t JOIN_EUI = 0x0000000000000000ULL;
-static const uint64_t DEV_EUI  = 0x70B3D57ED0075678ULL;
-
-static const uint8_t APP_KEY[16] = {
-  0x74, 0x51, 0xDC, 0xC4,
-  0xD4, 0xCC, 0xA8, 0xA8,
-  0xC4, 0xF3, 0x11, 0xEB,
-  0x09, 0xCD, 0x73, 0x2D
-};
-
-static const uint8_t NWK_KEY[16] = {
-  0x94, 0x60, 0xA0, 0x60,
-  0xE8, 0x29, 0x60, 0x3D,
-  0x75, 0x2F, 0xC0, 0xFF,
-  0xDC, 0x6A, 0xA5, 0xF0
-};
 
 // ---------------- T-Beam S3 Supreme SX1262 pinmap ----------------
 static constexpr int LORA_SCK  = 12;
