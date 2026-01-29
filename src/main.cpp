@@ -8,7 +8,7 @@
 
 #include <SPI.h>
 #include <RadioLib.h>
-#include <Preferences.h>
+#include "Preferences.h"
 
 #include "secrets.h"
 
