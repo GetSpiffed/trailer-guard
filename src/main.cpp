@@ -46,6 +46,7 @@ static constexpr uint32_t UPLINK_INTERVAL_MS = 60000;
 static constexpr uint32_t JOIN_RETRY_MS = 10000;
 static constexpr uint32_t RESTORE_TEST_DELAY_MS = 2000;
 static constexpr uint8_t  JOIN_MAX_ATTEMPTS = 8;
+static constexpr uint8_t  RADIO_INIT_MAX_ATTEMPTS = 5;
 
 // ---------------- Globals ----------------
 XPowersAXP2101 axp;
@@ -97,6 +98,7 @@ struct AppState {
   uint32_t nextUplinkMs = 0;
   uint32_t lastUplinkOkMs = 0;
   uint8_t joinAttempts = 0;
+  uint8_t radioInitAttempts = 0;
   bool radioReady = false;
   bool joined = false;
   bool sessionRestored = false;
@@ -203,6 +205,12 @@ struct DisplayManager {
     if (uplinkOk) return "OK";
     switch (err) {
       case RADIOLIB_ERR_NONE: return "NONE";
+#ifdef RADIOLIB_ERR_JOIN_FAILED
+      case RADIOLIB_ERR_JOIN_FAILED: return "JOIN_FAILED";
+#endif
+#ifdef RADIOLIB_ERR_NO_JOIN_ACCEPT
+      case RADIOLIB_ERR_NO_JOIN_ACCEPT: return "NO_ACCEPT";
+#endif
 #ifdef RADIOLIB_ERR_RX_TIMEOUT
       case RADIOLIB_ERR_RX_TIMEOUT: return "TIMEOUT";
 #endif
@@ -251,11 +259,28 @@ struct DisplayManager {
 
     // 2) Join state + countdown
     if (countdown > 0) {
-      snprintf(line, sizeof(line), "JOIN %s T-%lds",
+      uint8_t attempt = (state.joinState == JoinState::Radio)
+                          ? state.radioInitAttempts
+                          : state.joinAttempts;
+      uint8_t maxAttempt = (state.joinState == JoinState::Radio)
+                             ? RADIO_INIT_MAX_ATTEMPTS
+                             : JOIN_MAX_ATTEMPTS;
+      snprintf(line, sizeof(line), "JOIN %s %u/%u T-%lds",
                joinStateText(state.joinState),
+               (unsigned)attempt,
+               (unsigned)maxAttempt,
                (long)countdown);
     } else {
-      snprintf(line, sizeof(line), "JOIN %s", joinStateText(state.joinState));
+      uint8_t attempt = (state.joinState == JoinState::Radio)
+                          ? state.radioInitAttempts
+                          : state.joinAttempts;
+      uint8_t maxAttempt = (state.joinState == JoinState::Radio)
+                             ? RADIO_INIT_MAX_ATTEMPTS
+                             : JOIN_MAX_ATTEMPTS;
+      snprintf(line, sizeof(line), "JOIN %s %u/%u",
+               joinStateText(state.joinState),
+               (unsigned)attempt,
+               (unsigned)maxAttempt);
     }
     u8g2.drawStr(0, 30, line);
 
@@ -628,6 +653,7 @@ static void resetJoinState() {
   app.nextUplinkMs = 0;
   app.lastUplinkOkMs = 0;
   app.joinAttempts = 0;
+  app.radioInitAttempts = 0;
   app.radioReady = false;
   app.joined = false;
   app.sessionRestored = false;
@@ -651,12 +677,19 @@ static void updateJoinFlow() {
 
   switch (app.joinState) {
     case JoinState::Radio: {
+      if (now < app.nextActionMs) return;
       app.radioReady = lorawanManager.initRadio(app);
       if (app.radioReady) {
         app.joinState = JoinState::Restore;
         app.nextActionMs = now;
       } else {
-        app.joinState = JoinState::Fail;
+        app.radioInitAttempts++;
+        if (app.radioInitAttempts >= RADIO_INIT_MAX_ATTEMPTS) {
+          app.joinState = JoinState::Fail;
+        } else {
+          app.joinState = JoinState::Radio;
+          app.nextActionMs = now + JOIN_RETRY_MS;
+        }
       }
       break;
     }
