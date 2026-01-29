@@ -694,14 +694,18 @@ static void updateJoinFlow() {
           lorawanManager.saveSession(saved);
         }
         app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
-      } else if (isSessionInvalidError(st)) {
-        lorawanManager.clearSession();
-        app.sessionRestored = false;
+      } else {
+        if (isSessionInvalidError(st)) {
+          lorawanManager.clearSession();
+          app.sessionRestored = false;
+        } else {
+          // Treat other restore test failures as stale as well:
+          // clear stored session so we do a clean OTAA next.
+          lorawanManager.clearSession();
+          app.sessionRestored = false;
+        }
         app.joinState = JoinState::Join;
         app.nextActionMs = now;
-      } else {
-        app.joinState = JoinState::Join;
-        app.nextActionMs = now + JOIN_RETRY_MS;
       }
       break;
     }
