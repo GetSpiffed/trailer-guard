@@ -47,6 +47,7 @@ static constexpr uint32_t JOIN_RETRY_MS = 10000;
 static constexpr uint32_t RESTORE_TEST_DELAY_MS = 2000;
 static constexpr uint8_t  JOIN_MAX_ATTEMPTS = 8;
 static constexpr uint8_t  RADIO_INIT_MAX_ATTEMPTS = 5;
+static constexpr float    RADIO_TCXO_VOLTAGE = 1.8f;
 
 // ---------------- Globals ----------------
 XPowersAXP2101 axp;
@@ -433,7 +434,17 @@ struct LoRaWanManager {
       return false;
     }
 
-    radio.setDio2AsRfSwitch(true);
+    st = radio.setTCXO(RADIO_TCXO_VOLTAGE);
+    if (st != RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = st;
+      return false;
+    }
+
+    st = radio.setDio2AsRfSwitch(true);
+    if (st != RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = st;
+      return false;
+    }
     radio.setOutputPower(14);
     radio.setCurrentLimit(140);
     state.lastLoraErr = RADIOLIB_ERR_NONE;
@@ -458,7 +469,7 @@ struct LoRaWanManager {
     }
 
     st = node.activateOTAA();
-    if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
+    if (st != RADIOLIB_LORAWAN_NEW_SESSION) {
       state.lastLoraErr = st;
       return false;
     }
@@ -729,11 +740,6 @@ static void updateJoinFlow() {
         app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
       } else {
         if (isSessionInvalidError(st)) {
-          lorawanManager.clearSession();
-          app.sessionRestored = false;
-        } else {
-          // Treat other restore test failures as stale as well:
-          // clear stored session so we do a clean OTAA next.
           lorawanManager.clearSession();
           app.sessionRestored = false;
         }
