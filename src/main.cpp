@@ -65,7 +65,8 @@ static uint16_t gpsCharsPerSec = 0;
 U8G2_SH1106_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, DEV_SCL, DEV_SDA, U8X8_PIN_NONE);
 
 // ---------------- LoRaWAN (RadioLib) ----------------
-SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
+SX1262 radio(new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY));
+
 LoRaWANNode node(&radio, &EU868);
 using LoRaWANSession = LoRaWANSchemeSession_t;
 #ifndef RADIOLIB_ERR_UNSUPPORTED
@@ -549,7 +550,14 @@ static bool isSessionInvalidError(int16_t err) {
 }
 
 static bool isUplinkOkError(int16_t err) {
-	return err == RADIOLIB_ERR_NONE;
+  if (err == RADIOLIB_ERR_NONE) return true;
+#ifdef RADIOLIB_ERR_RX_TIMEOUT
+  if (err == RADIOLIB_ERR_RX_TIMEOUT) return true;
+#endif
+#ifdef RADIOLIB_ERR_TIMEOUT
+  if (err == RADIOLIB_ERR_TIMEOUT) return true;
+#endif
+  return false;
 }
 
 static size_t buildPayload(uint8_t* out, size_t maxLen, const GpsSnapshot& gpsSnap) {
