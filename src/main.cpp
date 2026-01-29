@@ -100,6 +100,7 @@ struct AppState {
   bool radioReady = false;
   bool joined = false;
   bool sessionRestored = false;
+  bool forceOtaa = false;
 };
 
 static AppState app;
@@ -632,6 +633,17 @@ static void resetJoinState() {
   app.sessionRestored = false;
 }
 
+static bool checkForceOtaaOnBoot() {
+  static constexpr uint32_t HOLD_MS = 1500;
+  pinMode(BOOT_PIN, INPUT_PULLUP);
+  if (digitalRead(BOOT_PIN) != LOW) return false;
+  uint32_t start = millis();
+  while (digitalRead(BOOT_PIN) == LOW && (millis() - start < HOLD_MS)) {
+    delay(10);
+  }
+  return (millis() - start >= HOLD_MS);
+}
+
 static void updateJoinFlow() {
   if (app.gate != GateState::Running) return;
 
@@ -649,6 +661,11 @@ static void updateJoinFlow() {
       break;
     }
     case JoinState::Restore: {
+      if (app.forceOtaa) {
+        app.joinState = JoinState::Join;
+        app.nextActionMs = now;
+        break;
+      }
       LoRaWANSession session;
       if (lorawanManager.loadSession(session) &&
           lorawanManager.restoreSession(app, session)) {
@@ -677,14 +694,18 @@ static void updateJoinFlow() {
           lorawanManager.saveSession(saved);
         }
         app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
-      } else if (isSessionInvalidError(st)) {
-        lorawanManager.clearSession();
-        app.sessionRestored = false;
+      } else {
+        if (isSessionInvalidError(st)) {
+          lorawanManager.clearSession();
+          app.sessionRestored = false;
+        } else {
+          // Treat other restore test failures as stale as well:
+          // clear stored session so we do a clean OTAA next.
+          lorawanManager.clearSession();
+          app.sessionRestored = false;
+        }
         app.joinState = JoinState::Join;
         app.nextActionMs = now;
-      } else {
-        app.joinState = JoinState::Join;
-        app.nextActionMs = now + JOIN_RETRY_MS;
       }
       break;
     }
@@ -754,6 +775,11 @@ void setup() {
   displayManager.begin();
   gnssManager.begin();
   disableRadios();
+
+  if (checkForceOtaaOnBoot()) {
+    lorawanManager.clearSession();
+    app.forceOtaa = true;
+  }
 
   bootGate.begin();
   resetJoinState();
