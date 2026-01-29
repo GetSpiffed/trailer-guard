@@ -12,6 +12,8 @@
 
 #include "secrets.h"
 
+
+
 // ---------------- PMU bus ----------------
 TwoWire I2C_PMU(0);
 static constexpr uint8_t PMU_SDA = 42;
@@ -69,6 +71,32 @@ using LoRaWANSession = LoRaWANSchemeSession_t;
 #ifndef RADIOLIB_ERR_UNSUPPORTED
 #define RADIOLIB_ERR_UNSUPPORTED RADIOLIB_ERR_UNKNOWN
 #endif
+
+// ---- compile-time checks ----
+#include <type_traits>
+#include <utility>
+
+template <typename T>
+struct has_getBufferNonces {
+  template <typename U>
+  static auto test(int) -> decltype(std::declval<U>().getBufferNonces(), std::true_type{});
+  template <typename>
+  static auto test(...) -> std::false_type;
+  static constexpr bool value = decltype(test<T>(0))::value;
+};
+
+template <typename T>
+struct has_setBufferNonces {
+  template <typename U>
+  static auto test(int) -> decltype(std::declval<U>().setBufferNonces((const uint8_t*)nullptr), std::true_type{});
+  template <typename>
+  static auto test(...) -> std::false_type;
+  static constexpr bool value = decltype(test<T>(0))::value;
+};
+
+static_assert(has_getBufferNonces<decltype(node)>::value, "node heeft GEEN getBufferNonces()");
+static_assert(has_setBufferNonces<decltype(node)>::value, "node heeft GEEN setBufferNonces(const uint8_t*)");
+
 
 enum class GateState : uint8_t {
 	WaitingForBoot,
@@ -301,19 +329,20 @@ struct DisplayManager {
 		u8g2.drawStr(0, 42, line);
 
 		// 4) GPS diagnostics
-		// if (gpsSnap.charsPerSec == 0) {
-		// 	snprintf(line, sizeof(line), "GPS NO UART");
-		// } else {
-		// 	const char* fixText = gpsSnap.fix ? "FIX" : "NOFIX";
-		// 	float hdop = gpsSnap.hdop / 100.0f;
-		// 	snprintf(line, sizeof(line), "GPS %uc/s S%u H%.1f A%lus %s",
-		// 					 (unsigned)gpsSnap.charsPerSec,
-		// 					 (unsigned)gpsSnap.sats,
-		// 					 (double)hdop,
-		// 					 (unsigned)(gpsSnap.ageMs / 1000),
-		// 					 fixText);
-		// }
-		// u8g2.drawStr(0, 60, line);
+		if (gpsSnap.charsPerSec == 0) {
+			snprintf(line, sizeof(line), "GPS NO UART");
+		} else {
+				const char* v = gpsSnap.locationValid ? "VAL" : "NOVAL";
+				const char* f = gpsSnap.fix ? "FIX" : "NOFIX";
+				snprintf(line, sizeof(line), "GPS %uc/s S%u H%.1f A%lus %s %s",
+					(unsigned)gpsSnap.charsPerSec,
+					(unsigned)gpsSnap.sats,
+					(double)(gpsSnap.hdop / 100.0f),
+					(unsigned)(gpsSnap.ageMs / 1000),
+					v, f);
+		}
+		u8g2.drawStr(0, 54, line);
+
 		snprintf(line, sizeof(line), "DN %u set %d", (unsigned)state.lastDevNonce, (int)state.lastDevNonceSetErr);
 		u8g2.drawStr(0, 60, line);
 
@@ -356,204 +385,233 @@ struct StoredSession {
 };
 
 // ---- LoRaWAN Manager ----
+// ---- LoRaWAN Manager ----
+// Drop-in replacement: session + NONCES buffer persistence (RadioLib v7.5.x style)
+// - bewaart session zoals je al deed
+// - bewaart óók LoRaWAN nonces buffer in NVS key "nonces"
+// - gebruikt DevNonce setters NIET meer (die geven bij jou -25)
 struct LoRaWanManager {
-	static bool loadSession(LoRaWANSession& session) {
-		Preferences prefs;
-		if (!prefs.begin("lorawan", true)) return false;
-		size_t len = prefs.getBytesLength("session");
-		if (len != sizeof(StoredSession)) {
-			prefs.end();
-			return false;
-		}
-		StoredSession stored{};
-		size_t read = prefs.getBytes("session", &stored, sizeof(stored));
-		prefs.end();
-		if (read != sizeof(stored)) return false;
-		if (stored.magic != SESSION_MAGIC) return false;
-		if (stored.version != SESSION_VERSION) return false;
-		if (stored.size != sizeof(LoRaWANSession)) return false;
-		session = stored.session;
-		return true;
-	}
-
-	static bool saveSession(const LoRaWANSession& session) {
-		Preferences prefs;
-		if (!prefs.begin("lorawan", false)) return false;
-		StoredSession stored{};
-		stored.magic = SESSION_MAGIC;
-		stored.version = SESSION_VERSION;
-		stored.size = sizeof(LoRaWANSession);
-		stored.session = session;
-		size_t written = prefs.putBytes("session", &stored, sizeof(stored));
-		prefs.end();
-		return written == sizeof(stored);
-	}
-
-	static void clearSession() {
-		Preferences prefs;
-		if (!prefs.begin("lorawan", false)) return;
-		prefs.remove("session");
-		prefs.end();
-	}
-
-	template <typename Node, typename Session>
-	static auto setNodeSession(Node& target, const Session& session, int)
-			-> decltype(target.setSession(&session), int16_t()) {
-		return target.setSession(&session);
-	}
-
-	template <typename Node, typename Session>
-	static auto setNodeSession(Node& target, const Session& session, long)
-			-> decltype(target.setSession(session), int16_t()) {
-		return target.setSession(session);
-	}
-
-	template <typename Node, typename Session>
-	static int16_t setNodeSession(Node&, const Session&, ...) {
-		return RADIOLIB_ERR_UNSUPPORTED;
-	}
-
-	template <typename Node, typename Session>
-	static auto getNodeSession(Node& target, Session& session, int)
-			-> decltype(target.getSession(&session), int16_t()) {
-		return target.getSession(&session);
-	}
-
-	template <typename Node, typename Session>
-	static auto getNodeSession(Node& target, Session& session, long)
-			-> decltype(target.getSession(session), int16_t()) {
-		return target.getSession(session);
-	}
-
-	template <typename Node, typename Session>
-	static int16_t getNodeSession(Node&, Session&, ...) {
-		return RADIOLIB_ERR_UNSUPPORTED;
-	}
-
-  // ---- DevNonce persistence (OTAA) ----
-  static uint16_t loadDevNonce() {
+  // ---------- Session storage ----------
+  static bool loadSession(LoRaWANSession& session) {
     Preferences prefs;
-    if (!prefs.begin("lorawan", true)) return 0;
-    uint16_t dn = prefs.getUShort("devnonce", 0);
+    if (!prefs.begin("lorawan", true)) return false;
+    size_t len = prefs.getBytesLength("session");
+    if (len != sizeof(StoredSession)) {
+      prefs.end();
+      return false;
+    }
+    StoredSession stored{};
+    size_t read = prefs.getBytes("session", &stored, sizeof(stored));
     prefs.end();
-    return dn;
+    if (read != sizeof(stored)) return false;
+    if (stored.magic != SESSION_MAGIC) return false;
+    if (stored.version != SESSION_VERSION) return false;
+    if (stored.size != sizeof(LoRaWANSession)) return false;
+    session = stored.session;
+    return true;
   }
 
-  static void saveDevNonce(uint16_t dn) {
+  static bool saveSession(const LoRaWANSession& session) {
+    Preferences prefs;
+    if (!prefs.begin("lorawan", false)) return false;
+    StoredSession stored{};
+    stored.magic = SESSION_MAGIC;
+    stored.version = SESSION_VERSION;
+    stored.size = sizeof(LoRaWANSession);
+    stored.session = session;
+    size_t written = prefs.putBytes("session", &stored, sizeof(stored));
+    prefs.end();
+    return written == sizeof(stored);
+  }
+
+  static void clearSession() {
     Preferences prefs;
     if (!prefs.begin("lorawan", false)) return;
-    prefs.putUShort("devnonce", dn);
+    prefs.remove("session");
+    prefs.remove("nonces");   // <-- belangrijk: nonces ook weggooien als je "reset"
     prefs.end();
   }
 
-  // Try to set DevNonce on LoRaWANNode if the method exists (varies per RadioLib version)
-  template <typename NodeT>
-  static auto setNodeDevNonce(NodeT& n, uint16_t dn, int)
-      -> decltype(n.setDevNonce(dn), int16_t()) {
-    return n.setDevNonce(dn);
+  // ---------- Session ↔ node glue (compat) ----------
+  template <typename NodeT, typename SessionT>
+  static auto setNodeSession(NodeT& target, const SessionT& session, int)
+      -> decltype(target.setSession(&session), int16_t()) {
+    return target.setSession(&session);
   }
 
-  template <typename NodeT>
-  static auto setNodeDevNonce(NodeT& n, uint16_t dn, long)
-      -> decltype(n.setOtaaDevNonce(dn), int16_t()) {
-    return n.setOtaaDevNonce(dn);
+  template <typename NodeT, typename SessionT>
+  static auto setNodeSession(NodeT& target, const SessionT& session, long)
+      -> decltype(target.setSession(session), int16_t()) {
+    return target.setSession(session);
   }
 
-  template <typename NodeT>
-  static auto setNodeDevNonce(NodeT& n, uint16_t dn, char)
-      -> decltype(n.setOTAADevNonce(dn), int16_t()) {
-    return n.setOTAADevNonce(dn);
-  }
-
-  template <typename NodeT>
-  static int16_t setNodeDevNonce(NodeT&, uint16_t, ...) {
+  template <typename NodeT, typename SessionT>
+  static int16_t setNodeSession(NodeT&, const SessionT&, ...) {
     return RADIOLIB_ERR_UNSUPPORTED;
   }
 
+  template <typename NodeT, typename SessionT>
+  static auto getNodeSession(NodeT& target, SessionT& session, int)
+      -> decltype(target.getSession(&session), int16_t()) {
+    return target.getSession(&session);
+  }
 
-	bool initRadio(AppState& state) {
-		SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  template <typename NodeT, typename SessionT>
+  static auto getNodeSession(NodeT& target, SessionT& session, long)
+      -> decltype(target.getSession(session), int16_t()) {
+    return target.getSession(session);
+  }
 
-		pinMode(LORA_RST, OUTPUT);
-		digitalWrite(LORA_RST, LOW);
-		delay(50);
-		digitalWrite(LORA_RST, HIGH);
-		delay(50);
+  template <typename NodeT, typename SessionT>
+  static int16_t getNodeSession(NodeT&, SessionT&, ...) {
+    return RADIOLIB_ERR_UNSUPPORTED;
+  }
 
-		int16_t st = radio.begin();
-		if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
+  // ---------- Nonces buffer persistence (RadioLib v7.x) ----------
+  // SFINAE helpers to avoid compile errors if your build lacks these methods/macros
+  template <typename NodeT>
+  static auto nodeGetBufferNonces(NodeT& n, int) -> decltype(n.getBufferNonces()) {
+    return n.getBufferNonces();
+  }
+  template <typename NodeT>
+  static uint8_t* nodeGetBufferNonces(NodeT&, ...) { return nullptr; }
 
-		st = radio.setTCXO(RADIO_TCXO_VOLTAGE);
-		if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
+  template <typename NodeT>
+  static auto nodeSetBufferNonces(NodeT& n, const uint8_t* buf, int) -> decltype(n.setBufferNonces(buf), void()) {
+    n.setBufferNonces(buf);
+  }
+  template <typename NodeT>
+  static void nodeSetBufferNonces(NodeT&, const uint8_t*, ...) {}
 
-		st = radio.setRegulatorDCDC();
-		if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
+  static bool loadNonces(uint8_t* out, size_t len) {
+    Preferences prefs;
+    if (!prefs.begin("lorawan", true)) return false;
+    size_t storedLen = prefs.getBytesLength("nonces");
+    if (storedLen != len) { prefs.end(); return false; }
+    size_t r = prefs.getBytes("nonces", out, len);
+    prefs.end();
+    return r == len;
+  }
 
-		st = radio.setDio2AsRfSwitch(true);
-		if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
+  static bool saveNonces(const uint8_t* in, size_t len) {
+    Preferences prefs;
+    if (!prefs.begin("lorawan", false)) return false;
+    size_t w = prefs.putBytes("nonces", in, len);
+    prefs.end();
+    return w == len;
+  }
 
-		radio.setOutputPower(14);
-		radio.setCurrentLimit(140);
+  // ---------- Radio init ----------
+  bool initRadio(AppState& state) {
+    SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
 
-		state.lastLoraErr = RADIOLIB_ERR_NONE;
-		return true;
-	}
+    pinMode(LORA_RST, OUTPUT);
+    digitalWrite(LORA_RST, LOW);
+    delay(50);
+    digitalWrite(LORA_RST, HIGH);
+    delay(50);
 
-	bool restoreSession(AppState& state, const LoRaWANSession& session) {
-		int16_t st = setNodeSession(node, session, 0);
-		if (st != RADIOLIB_ERR_NONE) {
-			state.lastLoraErr = st;
-			return false;
-		}
-		state.lastLoraErr = RADIOLIB_ERR_NONE;
-		return true;
-	}
+    int16_t st = radio.begin();
+    if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
 
-	bool join(AppState& state) {
-		// 1) init OTAA
-		int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
-		if (st != RADIOLIB_ERR_NONE) {
-			state.lastLoraErr = st;
-			state.lastDevNonce = 0;
-			state.lastDevNonceSetErr = st;
-			return false;
-		}
+    st = radio.setTCXO(RADIO_TCXO_VOLTAGE);
+    if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
 
-		// 2) DevNonce: bump + opslaan + probeer te zetten
-		uint16_t dn = loadDevNonce();
-		dn = (dn == 0xFFFF) ? 1 : (uint16_t)(dn + 1);
-		saveDevNonce(dn);
+    st = radio.setRegulatorDCDC();
+    if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
 
-		int16_t dnSt = setNodeDevNonce(node, dn, 0);
-		state.lastDevNonce = dn;
-		state.lastDevNonceSetErr = dnSt;
+    st = radio.setDio2AsRfSwitch(true);
+    if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
 
-		// 3) join
-		st = node.activateOTAA();
-		if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
-			state.lastLoraErr = st;
-			return false;
-		}
+    radio.setOutputPower(14);
+    radio.setCurrentLimit(140);
 
-		state.lastLoraErr = RADIOLIB_ERR_NONE;
-		return true;
-	}
+    state.lastLoraErr = RADIOLIB_ERR_NONE;
+    return true;
+  }
 
+  bool restoreSession(AppState& state, const LoRaWANSession& session) {
+    int16_t st = setNodeSession(node, session, 0);
+    if (st != RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = st;
+      return false;
+    }
+    state.lastLoraErr = RADIOLIB_ERR_NONE;
+    return true;
+  }
 
-	bool fetchSession(AppState& state, LoRaWANSession& session) {
-		int16_t st = getNodeSession(node, session, 0);
-		if (st != RADIOLIB_ERR_NONE) {
-			state.lastLoraErr = st;
-			return false;
-		}
-		state.lastLoraErr = RADIOLIB_ERR_NONE;
-		return true;
-	}
+  // ---------- OTAA join (with NONCES buffer persistence) ----------
+  bool join(AppState& state) {
+    // reset debug fields
+    state.lastDevNonce = 0;
+    state.lastDevNonceSetErr = 0;
 
-	int16_t sendUplink(const uint8_t* payload, size_t len, uint8_t fport) {
-		return node.sendReceive(payload, len, fport);
-	}
+    // 1) init OTAA
+    int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
+    if (st != RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = st;
+      state.lastDevNonceSetErr = st;
+      return false;
+    }
+
+    // 2) restore nonces buffer if we can
+#if defined(RADIOLIB_LORAWAN_NONCES_BUF_SIZE)
+    {
+      uint8_t buf[RADIOLIB_LORAWAN_NONCES_BUF_SIZE];
+      if (loadNonces(buf, sizeof(buf))) {
+        nodeSetBufferNonces(node, buf, 0);
+        // “set ok” indicator (best-effort)
+        state.lastDevNonceSetErr = RADIOLIB_ERR_NONE;
+      } else {
+        // niet fout: gewoon geen stored nonces gevonden
+        state.lastDevNonceSetErr = RADIOLIB_ERR_NONE;
+      }
+    }
+#else
+    // jouw lib build heeft de nonces-buf macro niet -> dan kun je dit niet persistent maken op compile-time
+    state.lastDevNonceSetErr = RADIOLIB_ERR_UNSUPPORTED;
+#endif
+
+    // 3) join
+    st = node.activateOTAA();
+    if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
+      state.lastLoraErr = st;
+      return false;
+    }
+
+    // 4) save nonces buffer after successful join
+#if defined(RADIOLIB_LORAWAN_NONCES_BUF_SIZE)
+    {
+      uint8_t* noncesPtr = nodeGetBufferNonces(node, 0);
+      if (noncesPtr) {
+        (void)saveNonces(noncesPtr, RADIOLIB_LORAWAN_NONCES_BUF_SIZE);
+
+        // debug: laat “iets” oplopen op OLED (geen garantie welke bytes DevNonce zijn, maar handig als heartbeat)
+        // neem de eerste 2 bytes als teller (little-endian)
+        state.lastDevNonce = (uint16_t)(noncesPtr[0] | (uint16_t(noncesPtr[1]) << 8));
+      }
+    }
+#endif
+
+    state.lastLoraErr = RADIOLIB_ERR_NONE;
+    return true;
+  }
+
+  bool fetchSession(AppState& state, LoRaWANSession& session) {
+    int16_t st = getNodeSession(node, session, 0);
+    if (st != RADIOLIB_ERR_NONE) {
+      state.lastLoraErr = st;
+      return false;
+    }
+    state.lastLoraErr = RADIOLIB_ERR_NONE;
+    return true;
+  }
+
+  int16_t sendUplink(const uint8_t* payload, size_t len, uint8_t fport) {
+    return node.sendReceive(payload, len, fport);
+  }
 };
+
 
 static PowerManager powerManager;
 static DisplayManager displayManager;
@@ -597,40 +655,57 @@ static bool isUplinkOkError(int16_t err) {
 }
 
 static size_t buildPayload(uint8_t* out, size_t maxLen, const GpsSnapshot& gpsSnap) {
-	if (maxLen < 13) return 0;
+  // payload: 1 + 1 + 2 + 2 + 4 + 4 + 2 + 2 = 18 bytes
+  if (maxLen < 18) return 0;
 
-	uint8_t msgType = gpsSnap.fix ? 0x01 : 0x02;
-	int32_t latE5 = 0;
-	int32_t lonE5 = 0;
-	uint16_t spd10 = 0;
+  uint8_t msgType = gpsSnap.fix ? 0x01 : 0x02;
 
-	if (gpsSnap.fix && gpsSnap.locationValid) {
-		latE5 = (int32_t)llround(gpsSnap.lat * 1e5);
-		lonE5 = (int32_t)llround(gpsSnap.lon * 1e5);
-		spd10 = (uint16_t)lroundf(gpsSnap.speedKmph * 10.0f);
-	}
+  // diagnose altijd
+  uint8_t sats = gpsSnap.sats;
+  uint16_t hdop = gpsSnap.hdop; // already in hundredths
+  uint16_t ageSec = (gpsSnap.ageMs >= 60000) ? 60 : (uint16_t)(gpsSnap.ageMs / 1000);
 
-	uint16_t battMv = readBatteryMv();
+  int32_t latE5 = 0;
+  int32_t lonE5 = 0;
+  uint16_t spd10 = 0;
 
-	out[0] = msgType;
-	out[1] = (uint8_t)(latE5 & 0xFF);
-	out[2] = (uint8_t)((latE5 >> 8) & 0xFF);
-	out[3] = (uint8_t)((latE5 >> 16) & 0xFF);
-	out[4] = (uint8_t)((latE5 >> 24) & 0xFF);
+  if (gpsSnap.locationValid) {
+    // let op: dit is "heeft een lat/lon", niet per se jouw fix-policy
+    // Wil je ALTIJD lat/lon meesturen zodra TinyGPS het valid vindt? Zet dit aan:
+    // (dan verstuur je ook "rommelige" posities, maar je ziet wél data)
+    latE5 = (int32_t)llround(gpsSnap.lat * 1e5);
+    lonE5 = (int32_t)llround(gpsSnap.lon * 1e5);
+    spd10 = gps.speed.isValid() ? (uint16_t)lroundf(gpsSnap.speedKmph * 10.0f) : 0;
+  }
 
-	out[5] = (uint8_t)(lonE5 & 0xFF);
-	out[6] = (uint8_t)((lonE5 >> 8) & 0xFF);
-	out[7] = (uint8_t)((lonE5 >> 16) & 0xFF);
-	out[8] = (uint8_t)((lonE5 >> 24) & 0xFF);
+  uint16_t battMv = readBatteryMv();
 
-	out[9]	= (uint8_t)(spd10 & 0xFF);
-	out[10] = (uint8_t)((spd10 >> 8) & 0xFF);
+  out[0] = msgType;
+  out[1] = sats;
+  out[2] = (uint8_t)(hdop & 0xFF);
+  out[3] = (uint8_t)((hdop >> 8) & 0xFF);
+  out[4] = (uint8_t)(ageSec & 0xFF);
+  out[5] = (uint8_t)((ageSec >> 8) & 0xFF);
 
-	out[11] = (uint8_t)(battMv & 0xFF);
-	out[12] = (uint8_t)((battMv >> 8) & 0xFF);
+  out[6]  = (uint8_t)(latE5 & 0xFF);
+  out[7]  = (uint8_t)((latE5 >> 8) & 0xFF);
+  out[8]  = (uint8_t)((latE5 >> 16) & 0xFF);
+  out[9]  = (uint8_t)((latE5 >> 24) & 0xFF);
 
-	return 13;
+  out[10] = (uint8_t)(lonE5 & 0xFF);
+  out[11] = (uint8_t)((lonE5 >> 8) & 0xFF);
+  out[12] = (uint8_t)((lonE5 >> 16) & 0xFF);
+  out[13] = (uint8_t)((lonE5 >> 24) & 0xFF);
+
+  out[14] = (uint8_t)(spd10 & 0xFF);
+  out[15] = (uint8_t)((spd10 >> 8) & 0xFF);
+
+  out[16] = (uint8_t)(battMv & 0xFF);
+  out[17] = (uint8_t)((battMv >> 8) & 0xFF);
+
+  return 18;
 }
+
 
 // ---- Boot short-press gate ----
 struct BootGate {
@@ -771,7 +846,7 @@ static void updateJoinFlow() {
 		case JoinState::TestUplink: {
 			if (now < app.nextActionMs) return;
 
-			uint8_t payload[16];
+			uint8_t payload[18];
 			GpsSnapshot snap = readGpsSnapshot();
 			size_t n = buildPayload(payload, sizeof(payload), snap);
 
@@ -835,7 +910,7 @@ static void updateUplinkFlow() {
 	uint32_t now = millis();
 	if (app.nextUplinkMs == 0 || now < app.nextUplinkMs) return;
 
-	uint8_t payload[16];
+	uint8_t payload[18];
 	GpsSnapshot snap = readGpsSnapshot();
 	size_t n = buildPayload(payload, sizeof(payload), snap);
 
