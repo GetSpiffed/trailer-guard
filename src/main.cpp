@@ -539,43 +539,80 @@ struct BootGate {
   static constexpr uint32_t MIN_PRESS_MS = 20;
   static constexpr uint32_t MAX_PRESS_MS = 1200;
 
+  enum class State {
+    Idle,
+    Pressing,
+    AwaitReleaseStable,
+    Open
+  };
+
   bool gateOpen = false;
-  bool lastReadDown = false;
-  bool stableDown = false;
-  uint32_t lastChangeMs = 0;
-  uint32_t downMs = 0;
+  bool lastRawDown = false;
+  uint32_t rawChangeMs = 0;
+  uint32_t pressStartMs = 0;
+  uint32_t releaseStartMs = 0;
+  State state = State::Idle;
   bool initialized = false;
 
   void begin() {
     pinMode(BOOT_PIN, INPUT_PULLUP);
-    lastReadDown = (digitalRead(BOOT_PIN) == LOW);
-    stableDown = lastReadDown;
-    lastChangeMs = millis();
+    lastRawDown = (digitalRead(BOOT_PIN) == LOW);
+    rawChangeMs = millis();
+    if (lastRawDown) {
+      state = State::Pressing;
+      pressStartMs = rawChangeMs;
+    }
     initialized = true;
   }
 
   void update() {
-    if (gateOpen) return;
+    if (gateOpen || state == State::Open) return;
     if (!initialized) begin();
 
-    bool down = (digitalRead(BOOT_PIN) == LOW);
+    bool rawDown = (digitalRead(BOOT_PIN) == LOW);
     uint32_t now = millis();
 
-    if (down != lastReadDown) {
-      lastChangeMs = now;
-      lastReadDown = down;
+    if (rawDown != lastRawDown) {
+      lastRawDown = rawDown;
+      rawChangeMs = now;
     }
 
-    if (now - lastChangeMs >= DEBOUNCE_MS && down != stableDown) {
-      stableDown = down;
-      if (stableDown) {
-        downMs = now;
-      } else {
-        uint32_t pressMs = now - downMs;
-        if (pressMs >= MIN_PRESS_MS && pressMs <= MAX_PRESS_MS) {
-          gateOpen = true;
+    switch (state) {
+      case State::Idle:
+        if (rawDown) {
+          state = State::Pressing;
+          pressStartMs = now;
         }
+        break;
+      case State::Pressing: {
+        if (rawDown) {
+          if (now - pressStartMs > MAX_PRESS_MS) {
+            state = State::Idle;
+          }
+        } else {
+          uint32_t pressMs = now - pressStartMs;
+          if (pressMs >= MIN_PRESS_MS && pressMs <= MAX_PRESS_MS) {
+            state = State::AwaitReleaseStable;
+            releaseStartMs = now;
+          } else {
+            state = State::Idle;
+          }
+        }
+        break;
       }
+      case State::AwaitReleaseStable:
+        if (rawDown) {
+          state = State::Pressing;
+          pressStartMs = now;
+        } else if (now - releaseStartMs >= DEBOUNCE_MS &&
+                   now - rawChangeMs >= DEBOUNCE_MS) {
+          gateOpen = true;
+          state = State::Open;
+        }
+        break;
+      case State::Open:
+      default:
+        break;
     }
   }
 };
