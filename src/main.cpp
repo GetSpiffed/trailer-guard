@@ -20,8 +20,10 @@ static constexpr uint8_t DEV_SDA = 17;
 static constexpr uint8_t DEV_SCL = 18;
 
 // ---------------- GNSS UART ----------------
-static constexpr uint8_t GNSS_RX_PIN = 8;
-static constexpr uint8_t GNSS_TX_PIN = 9;
+// Board docs: GNSS TX = GPIO8, GNSS RX = GPIO9
+// HardwareSerial.begin(baud, config, RX, TX): RX must be GPIO8, TX must be GPIO9
+static constexpr uint8_t GNSS_RX_PIN = 8;  // ESP32 RX <- GNSS TX
+static constexpr uint8_t GNSS_TX_PIN = 9;  // ESP32 TX -> GNSS RX
 static constexpr uint32_t GNSS_BAUD = 9600;
 
 // ---------------- BOOT button ----------------
@@ -54,12 +56,12 @@ static constexpr int LORA_RST  = 5;
 static constexpr int LORA_DIO1 = 1;
 static constexpr int LORA_BUSY = 4;
 
-// ---------------- App settings ----------------
-static constexpr uint8_t  LORAWAN_FPORT   = 1;
-static constexpr uint32_t CHG_LED_INTERVAL_MS = 30000;
-static constexpr uint32_t CHG_LED_PULSE_MS = 120;
-static constexpr uint8_t  RESTORE_UPLINK_MAX_TRIES = 2;
-static constexpr uint32_t RESTORE_UPLINK_RETRY_MS = 8000;
+// ---------------- App settings (tunable) ----------------
+static constexpr uint8_t  LORAWAN_FPORT = 1;
+static constexpr uint32_t UPLINK_INTERVAL_MS = 60000;
+static constexpr uint32_t JOIN_RETRY_MS = 10000;
+static constexpr uint32_t RESTORE_TEST_DELAY_MS = 2000;
+static constexpr uint8_t  JOIN_MAX_ATTEMPTS = 8;
 
 // ---------------- Globals ----------------
 XPowersAXP2101 axp;
@@ -68,14 +70,11 @@ TinyGPSPlus gps;
 
 // GPS stats (voor OLED diagnose)
 static uint32_t gpsChars = 0;
-static uint32_t gpsSentences = 0;
 static uint32_t gpsLastStatsMs = 0;
 static uint16_t gpsCharsPerSec = 0;
 
 // OLED: SH1106 128x64, SW I2C met expliciete pins
 U8G2_SH1106_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, DEV_SCL, DEV_SDA, U8X8_PIN_NONE);
-
-uint32_t lastDrawMs = 0;
 
 // ---------------- LoRaWAN (RadioLib) ----------------
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
@@ -85,114 +84,85 @@ using LoRaWANSession = LoRaWANSchemeSession_t;
 #define RADIOLIB_ERR_UNSUPPORTED RADIOLIB_ERR_UNKNOWN
 #endif
 
-enum class JoinStatus : uint8_t {
-  Boot,
-  RadioInit,
-  Restoring,
-  RestoreOk,
-  RestoreFail,
-  Joining,
-  JoinOk,
-  JoinFail
+enum class GateState : uint8_t {
+  WaitingForBoot,
+  Running
 };
 
-enum class UplinkStatus : uint8_t {
+enum class JoinState : uint8_t {
+  Radio,
+  Restore,
+  TestUplink,
+  Join,
+  Ok,
+  Fail
+};
+
+enum class UplinkResult : uint8_t {
   Idle,
   Ok,
   Fail
 };
 
-// app gate state
-enum class RunGate : uint8_t {
-  WaitingForBoot,
-  Starting,
-  Running
-};
-
 struct AppState {
-  JoinStatus joinStatus = JoinStatus::Boot;
-  UplinkStatus uplinkStatus = UplinkStatus::Idle;
+  GateState gate = GateState::WaitingForBoot;
+  JoinState joinState = JoinState::Radio;
+  UplinkResult uplinkResult = UplinkResult::Idle;
   int16_t lastLoraErr = 0;
+  uint32_t nextActionMs = 0;
+  uint32_t nextUplinkMs = 0;
   uint32_t lastUplinkOkMs = 0;
-  uint32_t nextJoinAttemptMs = 0;
+  uint8_t joinAttempts = 0;
   bool radioReady = false;
   bool joined = false;
-  bool uplinkSent = false;
   bool sessionRestored = false;
-  bool sessionChecked = false;
-  bool joinAttempted = false;
-  uint8_t restoreUplinkAttempts = 0;
-  uint32_t nextRestoreUplinkMs = 0;
-
-  RunGate gate = RunGate::WaitingForBoot;
 };
 
 static AppState app;
-static uint32_t nextChgLedBlinkMs = 0;
-static uint32_t chgLedPulseEndMs = 0;
 
-// ---------- GPS fix policy (structureel) ----------
-static inline bool gpsHasFixNow(TinyGPSPlus& g) {
-  // "fix" = recent + kwaliteit ok
-  bool hasFix = (g.location.age() < 5000);
+// ---------- GPS snapshot (cache TinyGPSPlus reads) ----------
+struct GpsSnapshot {
+  uint16_t charsPerSec = 0;
+  uint8_t sats = 0;
+  uint16_t hdop = 9999; // in hundredths
+  uint32_t ageMs = 999999;
+  bool locationValid = false;
+  double lat = 0.0;
+  double lon = 0.0;
+  float speedKmph = 0.0f;
+  bool fix = false;
+};
 
-  // HDOP is in honderdsten (bv 150 = 1.50). >500 => >5.0 is meh.
-  if (g.hdop.isValid() && g.hdop.value() > 500) hasFix = false;
+static inline bool gpsFixPolicy(uint32_t ageMs, uint16_t hdop, uint8_t sats) {
+  if (ageMs >= 5000) return false;
+  if (hdop > 500) return false; // > 5.0
+  if (sats < 4) return false;
+  return true;
+}
 
-  // optioneel maar handig: zonder sats geen echte fix
-  if (g.satellites.isValid() && g.satellites.value() < 4) hasFix = false;
-
-  return hasFix;
+static GpsSnapshot readGpsSnapshot() {
+  GpsSnapshot snap;
+  snap.charsPerSec = gpsCharsPerSec;
+  snap.sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  snap.hdop = gps.hdop.isValid() ? gps.hdop.value() : 9999;
+  bool locValid = gps.location.isValid();
+  snap.ageMs = locValid ? gps.location.age() : 999999;
+  snap.locationValid = locValid;
+  if (snap.locationValid) {
+    snap.lat = gps.location.lat();
+    snap.lon = gps.location.lng();
+  }
+  snap.speedKmph = gps.speed.isValid() ? gps.speed.kmph() : 0.0f;
+  snap.fix = gpsFixPolicy(snap.ageMs, snap.hdop, snap.sats);
+  return snap;
 }
 
 // ---------- PMU helpers ----------
-static void setChgLed(bool on) {
-  axp.setChargingLedMode(on ? XPOWERS_CHG_LED_ON : XPOWERS_CHG_LED_OFF);
-}
-
-static int chargerStatusRaw() {
-  // meestal: 0=not charging, 1=charging, 2=done
-  return axp.getChargerStatus();
-}
-
-static const char* chargerStatusText(int st) {
-  switch (st) {
-    case 0: return "NO";
-    case 1: return "CHG";
-    case 2: return "DONE";
-    default: return "?";
-  }
-}
-
-// LED constant aan bij CHG of DONE (USB eraan + klaar) om te zien dat USB "leeft"
-static bool isChargingOrDone() {
-  int st = chargerStatusRaw();
-  return (st == 1) || (st == 2);
-}
-
 static uint16_t readBatteryMv() {
   if (!axp.isBatteryConnect()) return 0;
-
-  // XPowersLib builds verschillen: soms V, soms mV, soms 10mV units
   float v = axp.getBattVoltage();
-
-  if (v > 0 && v < 10.0f) {
-    return (uint16_t)lroundf(v * 1000.0f);   // V -> mV
-  } else if (v >= 10.0f && v < 1000.0f) {
-    return (uint16_t)lroundf(v * 10.0f);     // 10mV units -> mV
-  } else {
-    return (uint16_t)lroundf(v);             // al mV
-  }
-}
-
-// VBUS / USB detect + VBUS spanning
-static bool hasVbus() {
-  return axp.isVbusIn();
-}
-
-static uint16_t readVbusMv() {
-  float v = axp.getVbusVoltage();
   if (v > 0 && v < 10.0f) return (uint16_t)lroundf(v * 1000.0f);
+  if (v >= 10.0f && v < 1000.0f) return (uint16_t)lroundf(v * 10.0f);
   return (uint16_t)lroundf(v);
 }
 
@@ -213,12 +183,15 @@ struct PowerManager {
 
     axp.setALDO3Voltage(3300);
     axp.enableALDO3();
-    delay(50);
-
-    axp.setALDO4Voltage(3300);
-    axp.enableALDO4();
 
     return true;
+  }
+
+  void enableGnssRail() {
+    // ALDO4 powers the GPS; enable before GNSS.begin() and wait briefly.
+    axp.setALDO4Voltage(3300);
+    axp.enableALDO4();
+    delay(150);
   }
 };
 
@@ -229,26 +202,43 @@ struct DisplayManager {
     u8g2.setFont(u8g2_font_6x10_tf);
   }
 
-  static const char* joinStatusText(JoinStatus status) {
-    switch (status) {
-      case JoinStatus::Boot:      return "BOOT";
-      case JoinStatus::RadioInit: return "RADIO INIT";
-      case JoinStatus::Restoring: return "RESTORING";
-      case JoinStatus::RestoreOk: return "RESTORE OK";
-      case JoinStatus::RestoreFail: return "RESTORE FAIL";
-      case JoinStatus::Joining:   return "JOINING...";
-      case JoinStatus::JoinOk:    return "JOIN OK";
-      case JoinStatus::JoinFail:  return "JOIN FAIL";
-      default:                    return "";
+  static const char* joinStateText(JoinState state) {
+    switch (state) {
+      case JoinState::Radio:      return "RADIO";
+      case JoinState::Restore:    return "RESTORE";
+      case JoinState::TestUplink: return "TESTUP";
+      case JoinState::Join:       return "JOIN";
+      case JoinState::Ok:         return "OK";
+      case JoinState::Fail:       return "FAIL";
+      default:                    return "?";
     }
   }
 
-  void render(const AppState& state, TinyGPSPlus& gps,
-              uint16_t battMv, uint8_t battPct,
-              int chgRaw, bool vbus, uint16_t vbusMv) {
+  static const char* loraErrLabel(int16_t err, bool uplinkOk) {
+    if (uplinkOk) return "OK";
+    switch (err) {
+      case RADIOLIB_ERR_NONE: return "NONE";
+#ifdef RADIOLIB_ERR_RX_TIMEOUT
+      case RADIOLIB_ERR_RX_TIMEOUT: return "TIMEOUT";
+#endif
+#ifdef RADIOLIB_ERR_TIMEOUT
+      case RADIOLIB_ERR_TIMEOUT: return "TIMEOUT";
+#endif
+#ifdef RADIOLIB_ERR_MIC_MISMATCH
+      case RADIOLIB_ERR_MIC_MISMATCH: return "MIC_MISMATCH";
+#endif
+#ifdef RADIOLIB_ERR_INVALID_FCNT
+      case RADIOLIB_ERR_INVALID_FCNT: return "INVALID_FCNT";
+#endif
+#ifdef RADIOLIB_ERR_DOWNLINK_MALFORMED
+      case RADIOLIB_ERR_DOWNLINK_MALFORMED: return "DOWNLINK_BAD";
+#endif
+      default: return "OTHER";
+    }
+  }
 
-    (void)chgRaw; (void)vbus; (void)vbusMv; // nu niet getoond (later evt)
-
+  void render(const AppState& state, const GpsSnapshot& gpsSnap,
+              uint16_t battMv, uint8_t battPct) {
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x10_tf);
 
@@ -260,40 +250,52 @@ struct DisplayManager {
              (unsigned)battPct);
     u8g2.drawStr(0, 12, line);
 
-    // Gate screen
-    if (state.gate != RunGate::Running) {
-      u8g2.drawStr(0, 40, "Press BOOT to start");
-      u8g2.drawStr(0, 58, "(short press)");
+    if (state.gate != GateState::Running) {
+      u8g2.drawStr(0, 30, "Press BOOT");
+      u8g2.drawStr(0, 42, "short press");
+      u8g2.drawStr(0, 60, "to start");
       u8g2.sendBuffer();
       return;
     }
 
-    // 2) Join status
-    snprintf(line, sizeof(line), "JOIN:%s", joinStatusText(state.joinStatus));
-    u8g2.drawStr(0, 34, line);
-
-    // 3) LoRa error
-    snprintf(line, sizeof(line), "ERR:%d", (int)state.lastLoraErr);
-    u8g2.drawStr(0, 46, line);
-
-    // 4) GPS diagnostics (zelfde fix-policy als payload)
-    int sat = gps.satellites.isValid() ? gps.satellites.value() : 0;
-    uint32_t ageMs = gps.location.isValid() ? gps.location.age() : 999999;
-    bool hasFix = gpsHasFixNow(gps);
-
-    if (hasFix) {
-      snprintf(line, sizeof(line),
-               "GPS FIX S:%d A:%lus",
-               sat,
-               (unsigned)(ageMs / 1000));
-    } else {
-      snprintf(line, sizeof(line),
-               "GPS NO  %uc/s S:%d",
-               (unsigned)gpsCharsPerSec,
-               sat);
+    uint32_t now = millis();
+    int32_t countdown = 0;
+    if (state.nextActionMs > now) {
+      countdown = (int32_t)((state.nextActionMs - now) / 1000);
     }
 
-    u8g2.drawStr(0, 58, line);
+    // 2) Join state + countdown
+    if (countdown > 0) {
+      snprintf(line, sizeof(line), "JOIN %s T-%lds",
+               joinStateText(state.joinState),
+               (long)countdown);
+    } else {
+      snprintf(line, sizeof(line), "JOIN %s", joinStateText(state.joinState));
+    }
+    u8g2.drawStr(0, 30, line);
+
+    // 3) LoRa error line
+    bool uplinkOk = (state.uplinkResult == UplinkResult::Ok);
+    snprintf(line, sizeof(line), "LORA %d %s",
+             (int)state.lastLoraErr,
+             loraErrLabel(state.lastLoraErr, uplinkOk));
+    u8g2.drawStr(0, 42, line);
+
+    // 4) GPS diagnostics
+    if (gpsSnap.charsPerSec == 0) {
+      snprintf(line, sizeof(line), "GPS NO UART");
+    } else {
+      const char* fixText = gpsSnap.fix ? "FIX" : "NOFIX";
+      float hdop = gpsSnap.hdop / 100.0f;
+      snprintf(line, sizeof(line), "GPS %uc/s S%u H%.1f A%lus %s",
+               (unsigned)gpsSnap.charsPerSec,
+               (unsigned)gpsSnap.sats,
+               (double)hdop,
+               (unsigned)(gpsSnap.ageMs / 1000),
+               fixText);
+    }
+    u8g2.drawStr(0, 60, line);
+
     u8g2.sendBuffer();
   }
 };
@@ -308,9 +310,7 @@ struct GnssManager {
     while (GNSS.available()) {
       char c = (char)GNSS.read();
       gpsChars++;
-      if (gps.encode(c)) {
-        gpsSentences++;
-      }
+      gps.encode(c);
     }
 
     uint32_t now = millis();
@@ -322,37 +322,54 @@ struct GnssManager {
   }
 };
 
-static size_t buildPayload(uint8_t* out, size_t maxLen);
+// ---- LoRaWAN session storage ----
+static constexpr uint32_t SESSION_MAGIC = 0x4C57534Eu; // "LWSN"
+static constexpr uint16_t SESSION_VERSION = 1;
+
+struct StoredSession {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  LoRaWANSession session;
+};
 
 // ---- LoRaWAN Manager ----
 struct LoRaWanManager {
   static bool loadSession(LoRaWANSession& session) {
     Preferences prefs;
     if (!prefs.begin("lorawan", true)) return false;
-    bool valid = prefs.getBool("valid", false);
     size_t len = prefs.getBytesLength("session");
-    if (!valid || len != sizeof(session)) {
+    if (len != sizeof(StoredSession)) {
       prefs.end();
       return false;
     }
-    size_t read = prefs.getBytes("session", &session, sizeof(session));
+    StoredSession stored{};
+    size_t read = prefs.getBytes("session", &stored, sizeof(stored));
     prefs.end();
-    return read == sizeof(session);
+    if (read != sizeof(stored)) return false;
+    if (stored.magic != SESSION_MAGIC) return false;
+    if (stored.version != SESSION_VERSION) return false;
+    if (stored.size != sizeof(LoRaWANSession)) return false;
+    session = stored.session;
+    return true;
   }
 
   static bool saveSession(const LoRaWANSession& session) {
     Preferences prefs;
     if (!prefs.begin("lorawan", false)) return false;
-    prefs.putBool("valid", true);
-    size_t written = prefs.putBytes("session", &session, sizeof(session));
+    StoredSession stored{};
+    stored.magic = SESSION_MAGIC;
+    stored.version = SESSION_VERSION;
+    stored.size = sizeof(LoRaWANSession);
+    stored.session = session;
+    size_t written = prefs.putBytes("session", &stored, sizeof(stored));
     prefs.end();
-    return written == sizeof(session);
+    return written == sizeof(stored);
   }
 
   static void clearSession() {
     Preferences prefs;
     if (!prefs.begin("lorawan", false)) return;
-    prefs.remove("valid");
     prefs.remove("session");
     prefs.end();
   }
@@ -409,7 +426,7 @@ struct LoRaWanManager {
     radio.setDio2AsRfSwitch(true);
     radio.setOutputPower(14);
     radio.setCurrentLimit(140);
-    state.lastLoraErr = 0;
+    state.lastLoraErr = RADIOLIB_ERR_NONE;
     return true;
   }
 
@@ -419,7 +436,7 @@ struct LoRaWanManager {
       state.lastLoraErr = st;
       return false;
     }
-    state.lastLoraErr = 0;
+    state.lastLoraErr = RADIOLIB_ERR_NONE;
     return true;
   }
 
@@ -436,7 +453,7 @@ struct LoRaWanManager {
       return false;
     }
 
-    state.lastLoraErr = 0;
+    state.lastLoraErr = RADIOLIB_ERR_NONE;
     return true;
   }
 
@@ -446,29 +463,12 @@ struct LoRaWanManager {
       state.lastLoraErr = st;
       return false;
     }
-    state.lastLoraErr = 0;
+    state.lastLoraErr = RADIOLIB_ERR_NONE;
     return true;
   }
 
-  void sendOnce(AppState& state) {
-    uint8_t payload[16];
-    size_t n = buildPayload(payload, sizeof(payload));
-    if (n == 0) return;
-
-    int16_t st = node.sendReceive(payload, n, LORAWAN_FPORT);
-
-    bool ok = (st == RADIOLIB_ERR_NONE
-#ifdef RADIOLIB_ERR_RX_TIMEOUT
-        || st == RADIOLIB_ERR_RX_TIMEOUT
-#endif
-#ifdef RADIOLIB_ERR_TIMEOUT
-        || st == RADIOLIB_ERR_TIMEOUT
-#endif
-    );
-
-    state.uplinkStatus = ok ? UplinkStatus::Ok : UplinkStatus::Fail;
-    state.lastUplinkOkMs = ok ? millis() : state.lastUplinkOkMs;
-    state.lastLoraErr = st; // laat staan voor debug
+  int16_t sendUplink(const uint8_t* payload, size_t len, uint8_t fport) {
+    return node.sendReceive(payload, len, fport);
   }
 };
 
@@ -477,186 +477,19 @@ static DisplayManager displayManager;
 static GnssManager gnssManager;
 static LoRaWanManager lorawanManager;
 
-// payload: 13 bytes
-static size_t buildPayload(uint8_t* out, size_t maxLen) {
-  if (maxLen < 13) return 0;
-
-  // structureel: zelfde fix policy als OLED
-  bool hasFix = gpsHasFixNow(gps);
-  uint8_t msgType = hasFix ? 0x01 : 0x02;
-
-  int32_t latE5 = 0;
-  int32_t lonE5 = 0;
-  uint16_t spd10 = 0;
-
-  if (hasFix) {
-    latE5 = (int32_t)llround(gps.location.lat() * 1e5);
-    lonE5 = (int32_t)llround(gps.location.lng() * 1e5);
-
-    if (gps.speed.isValid()) {
-      float kmh = gps.speed.kmph();
-      spd10 = (uint16_t)lroundf(kmh * 10.0f);
-    }
-  }
-
-  uint16_t battMv = readBatteryMv();
-
-  out[0] = msgType;
-
-  out[1] = (uint8_t)(latE5 & 0xFF);
-  out[2] = (uint8_t)((latE5 >> 8) & 0xFF);
-  out[3] = (uint8_t)((latE5 >> 16) & 0xFF);
-  out[4] = (uint8_t)((latE5 >> 24) & 0xFF);
-
-  out[5] = (uint8_t)(lonE5 & 0xFF);
-  out[6] = (uint8_t)((lonE5 >> 8) & 0xFF);
-  out[7] = (uint8_t)((lonE5 >> 16) & 0xFF);
-  out[8] = (uint8_t)((lonE5 >> 24) & 0xFF);
-
-  out[9]  = (uint8_t)(spd10 & 0xFF);
-  out[10] = (uint8_t)((spd10 >> 8) & 0xFF);
-
-  out[11] = (uint8_t)(battMv & 0xFF);
-  out[12] = (uint8_t)((battMv >> 8) & 0xFF);
-
-  return 13;
-}
-
-// ---- App State / Flow ----
 static void disableRadios() {
   WiFi.mode(WIFI_OFF);
   btStop();
 }
 
-// gate state machine (short press)
-static void updateStartGate() {
-  // tunables
-  static constexpr uint32_t DEBOUNCE_MS   = 25;   // stabiel voordat we 'm echt vinden
-  static constexpr uint32_t MIN_PRESS_MS  = 20;   // kortste tap die we accepteren
-  static constexpr uint32_t MAX_PRESS_MS  = 1200; // alles daarboven negeren (optioneel)
-
-  static bool inited = false;
-  static bool lastReadDown = false;
-  static bool stableDown = false;
-  static uint32_t lastChangeMs = 0;
-  static uint32_t downMs = 0;
-  static const uint32_t debounceMs = 25;
-  static const uint32_t minPressMs = 30;
-
-  if (!inited) {
-    pinMode(BOOT_PIN, INPUT_PULLUP);
-    rawLast = digitalRead(BOOT_PIN);
-    stableState = rawLast;
-    stableLast = rawLast;
-    rawChangeMs = millis();
-    inited = true;
-  }
-
-  if (app.gate == RunGate::Running) return;
-
-  bool down = (digitalRead(BOOT_PIN) == LOW); // actief-low
-  uint32_t now = millis();
-
-  if (down != lastReadDown) {
-    lastChangeMs = now;
-    lastReadDown = down;
-  }
-
-  if (now - lastChangeMs >= debounceMs && down != stableDown) {
-    stableDown = down;
-    if (stableDown) {
-      downMs = now;
-    } else {
-      if (now - downMs >= minPressMs) {
-        app.gate = RunGate::Running;
-
-        app.joinStatus = JoinStatus::Boot;
-        app.nextJoinAttemptMs = now;
-        app.joined = false;
-        app.uplinkSent = false;
-        app.uplinkStatus = UplinkStatus::Idle;
-        app.lastLoraErr = 0;
-        app.lastUplinkOkMs = 0;
-        app.sessionRestored = false;
-        app.sessionChecked = false;
-        app.joinAttempted = false;
-        app.restoreUplinkAttempts = 0;
-        app.nextRestoreUplinkMs = 0;
-      }
-    }
-  }
-}
-
-
-static void updateJoinFlow() {
-  uint32_t now = millis();
-
-  if (app.joinStatus == JoinStatus::Boot) {
-    app.joinStatus = JoinStatus::RadioInit;
-    return;
-  }
-
-  if (app.joinStatus == JoinStatus::RadioInit) {
-    app.radioReady = lorawanManager.initRadio(app);
-    if (app.radioReady) {
-      app.joinStatus = JoinStatus::Restoring;
-      app.nextJoinAttemptMs = now;
-    } else {
-      app.joinStatus = JoinStatus::JoinFail;
-    }
-    return;
-  }
-
-  if (app.joinStatus == JoinStatus::Restoring && !app.sessionChecked) {
-    app.sessionChecked = true;
-    LoRaWANSession session;
-    bool haveSession = lorawanManager.loadSession(session);
-    if (haveSession && lorawanManager.restoreSession(app, session)) {
-      app.joined = true;
-      app.sessionRestored = true;
-      app.joinStatus = JoinStatus::RestoreOk;
-      app.restoreUplinkAttempts = 0;
-      app.nextRestoreUplinkMs = now;
-      return;
-    }
-
-    app.joinStatus = JoinStatus::RestoreFail;
-    app.nextJoinAttemptMs = now + 400;
-    return;
-  }
-
-  if (app.joinStatus == JoinStatus::RestoreFail && !app.joined) {
-    if (app.joinAttempted) {
-      app.joinStatus = JoinStatus::JoinFail;
-      return;
-    }
-
-    if (now < app.nextJoinAttemptMs) return;
-
-    app.joinStatus = JoinStatus::Joining;
-    app.nextJoinAttemptMs = now + 1;
-    return;
-  }
-
-  if (app.joinStatus == JoinStatus::Joining && !app.joined) {
-    if (app.joinAttempted) return;
-    if (now < app.nextJoinAttemptMs) return;
-
-    app.joinAttempted = true;
-    bool ok = lorawanManager.join(app);
-    if (ok) {
-      app.joined = true;
-      app.joinStatus = JoinStatus::JoinOk;
-      LoRaWANSession session;
-      if (lorawanManager.fetchSession(app, session)) {
-        lorawanManager.saveSession(session);
-      }
-    } else {
-      app.lastUplinkOkMs = 0;
-      app.joinStatus = JoinStatus::JoinFail;
-    }
-    return;
-  }
+static bool isTimeoutErr(int16_t err) {
+#ifdef RADIOLIB_ERR_RX_TIMEOUT
+  if (err == RADIOLIB_ERR_RX_TIMEOUT) return true;
+#endif
+#ifdef RADIOLIB_ERR_TIMEOUT
+  if (err == RADIOLIB_ERR_TIMEOUT) return true;
+#endif
+  return false;
 }
 
 static bool isSessionInvalidError(int16_t err) {
@@ -676,125 +509,254 @@ static bool isSessionInvalidError(int16_t err) {
   }
 }
 
+static bool isUplinkOkError(int16_t err) {
+  return err == RADIOLIB_ERR_NONE || isTimeoutErr(err);
+}
+
+static size_t buildPayload(uint8_t* out, size_t maxLen, const GpsSnapshot& gpsSnap) {
+  if (maxLen < 13) return 0;
+
+  uint8_t msgType = gpsSnap.fix ? 0x01 : 0x02;
+  int32_t latE5 = 0;
+  int32_t lonE5 = 0;
+  uint16_t spd10 = 0;
+
+  if (gpsSnap.fix && gpsSnap.locationValid) {
+    latE5 = (int32_t)llround(gpsSnap.lat * 1e5);
+    lonE5 = (int32_t)llround(gpsSnap.lon * 1e5);
+    spd10 = (uint16_t)lroundf(gpsSnap.speedKmph * 10.0f);
+  }
+
+  uint16_t battMv = readBatteryMv();
+
+  out[0] = msgType;
+  out[1] = (uint8_t)(latE5 & 0xFF);
+  out[2] = (uint8_t)((latE5 >> 8) & 0xFF);
+  out[3] = (uint8_t)((latE5 >> 16) & 0xFF);
+  out[4] = (uint8_t)((latE5 >> 24) & 0xFF);
+
+  out[5] = (uint8_t)(lonE5 & 0xFF);
+  out[6] = (uint8_t)((lonE5 >> 8) & 0xFF);
+  out[7] = (uint8_t)((lonE5 >> 16) & 0xFF);
+  out[8] = (uint8_t)((lonE5 >> 24) & 0xFF);
+
+  out[9]  = (uint8_t)(spd10 & 0xFF);
+  out[10] = (uint8_t)((spd10 >> 8) & 0xFF);
+
+  out[11] = (uint8_t)(battMv & 0xFF);
+  out[12] = (uint8_t)((battMv >> 8) & 0xFF);
+
+  return 13;
+}
+
+// ---- Boot short-press gate ----
+struct BootGate {
+  static constexpr uint32_t DEBOUNCE_MS = 25;
+  static constexpr uint32_t MIN_PRESS_MS = 20;
+  static constexpr uint32_t MAX_PRESS_MS = 1200;
+
+  bool gateOpen = false;
+  bool lastReadDown = false;
+  bool stableDown = false;
+  uint32_t lastChangeMs = 0;
+  uint32_t downMs = 0;
+  bool initialized = false;
+
+  void begin() {
+    pinMode(BOOT_PIN, INPUT_PULLUP);
+    lastReadDown = (digitalRead(BOOT_PIN) == LOW);
+    stableDown = lastReadDown;
+    lastChangeMs = millis();
+    initialized = true;
+  }
+
+  void update() {
+    if (gateOpen) return;
+    if (!initialized) begin();
+
+    bool down = (digitalRead(BOOT_PIN) == LOW);
+    uint32_t now = millis();
+
+    if (down != lastReadDown) {
+      lastChangeMs = now;
+      lastReadDown = down;
+    }
+
+    if (now - lastChangeMs >= DEBOUNCE_MS && down != stableDown) {
+      stableDown = down;
+      if (stableDown) {
+        downMs = now;
+      } else {
+        uint32_t pressMs = now - downMs;
+        if (pressMs >= MIN_PRESS_MS && pressMs <= MAX_PRESS_MS) {
+          gateOpen = true;
+        }
+      }
+    }
+  }
+};
+
+static BootGate bootGate;
+
+static void resetJoinState() {
+  app.joinState = JoinState::Radio;
+  app.uplinkResult = UplinkResult::Idle;
+  app.lastLoraErr = RADIOLIB_ERR_NONE;
+  app.nextActionMs = millis();
+  app.nextUplinkMs = 0;
+  app.lastUplinkOkMs = 0;
+  app.joinAttempts = 0;
+  app.radioReady = false;
+  app.joined = false;
+  app.sessionRestored = false;
+}
+
+static void updateJoinFlow() {
+  if (app.gate != GateState::Running) return;
+
+  uint32_t now = millis();
+
+  switch (app.joinState) {
+    case JoinState::Radio: {
+      app.radioReady = lorawanManager.initRadio(app);
+      if (app.radioReady) {
+        app.joinState = JoinState::Restore;
+        app.nextActionMs = now;
+      } else {
+        app.joinState = JoinState::Fail;
+      }
+      break;
+    }
+    case JoinState::Restore: {
+      LoRaWANSession session;
+      if (lorawanManager.loadSession(session) &&
+          lorawanManager.restoreSession(app, session)) {
+        app.sessionRestored = true;
+        app.joinState = JoinState::TestUplink;
+        app.nextActionMs = now + RESTORE_TEST_DELAY_MS;
+      } else {
+        app.joinState = JoinState::Join;
+        app.nextActionMs = now;
+      }
+      break;
+    }
+    case JoinState::TestUplink: {
+      if (now < app.nextActionMs) return;
+      uint8_t payload[16];
+      GpsSnapshot snap = readGpsSnapshot();
+      size_t n = buildPayload(payload, sizeof(payload), snap);
+      int16_t st = lorawanManager.sendUplink(payload, n, LORAWAN_FPORT);
+      app.lastLoraErr = st;
+      app.uplinkResult = isUplinkOkError(st) ? UplinkResult::Ok : UplinkResult::Fail;
+      if (app.uplinkResult == UplinkResult::Ok) {
+        app.joined = true;
+        app.joinState = JoinState::Ok;
+        LoRaWANSession saved;
+        if (lorawanManager.fetchSession(app, saved)) {
+          lorawanManager.saveSession(saved);
+        }
+        app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
+      } else if (isSessionInvalidError(st)) {
+        lorawanManager.clearSession();
+        app.sessionRestored = false;
+        app.joinState = JoinState::Join;
+        app.nextActionMs = now;
+      } else {
+        app.joinState = JoinState::Join;
+        app.nextActionMs = now + JOIN_RETRY_MS;
+      }
+      break;
+    }
+    case JoinState::Join: {
+      if (now < app.nextActionMs) return;
+      if (app.joinAttempts >= JOIN_MAX_ATTEMPTS) {
+        app.joinState = JoinState::Fail;
+        return;
+      }
+      app.joinAttempts++;
+      bool ok = lorawanManager.join(app);
+      if (ok) {
+        app.joined = true;
+        app.joinState = JoinState::Ok;
+        LoRaWANSession session;
+        if (lorawanManager.fetchSession(app, session)) {
+          lorawanManager.saveSession(session);
+        }
+        app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
+      } else {
+        app.joinState = JoinState::Join;
+        app.nextActionMs = now + JOIN_RETRY_MS;
+      }
+      break;
+    }
+    case JoinState::Ok:
+    case JoinState::Fail:
+    default:
+      break;
+  }
+}
+
 static void updateUplinkFlow() {
   if (!app.joined) return;
 
   uint32_t now = millis();
+  if (app.nextUplinkMs == 0 || now < app.nextUplinkMs) return;
 
-  if (app.sessionRestored) {
-    if (app.restoreUplinkAttempts >= RESTORE_UPLINK_MAX_TRIES) return;
-    if (now < app.nextRestoreUplinkMs) return;
+  uint8_t payload[16];
+  GpsSnapshot snap = readGpsSnapshot();
+  size_t n = buildPayload(payload, sizeof(payload), snap);
 
-    app.restoreUplinkAttempts++;
-    lorawanManager.sendOnce(app);
+  int16_t st = lorawanManager.sendUplink(payload, n, LORAWAN_FPORT);
+  app.lastLoraErr = st;
+  app.uplinkResult = isUplinkOkError(st) ? UplinkResult::Ok : UplinkResult::Fail;
 
-    if (app.uplinkStatus == UplinkStatus::Ok) {
-      app.uplinkSent = true;
-      LoRaWANSession session;
-      if (lorawanManager.fetchSession(app, session)) {
-        lorawanManager.saveSession(session);
-      }
-      return;
-    }
-
-    if (isSessionInvalidError(app.lastLoraErr) ||
-        app.restoreUplinkAttempts >= RESTORE_UPLINK_MAX_TRIES) {
-      lorawanManager.clearSession();
-      app.joined = false;
-      app.sessionRestored = false;
-      app.joinStatus = JoinStatus::RestoreFail;
-      app.nextJoinAttemptMs = now;
-      return;
-    }
-
-    app.nextRestoreUplinkMs = now + RESTORE_UPLINK_RETRY_MS;
-    return;
-  }
-
-  if (app.uplinkSent) return;
-
-  lorawanManager.sendOnce(app);
-  app.uplinkSent = true;
-  if (app.uplinkStatus == UplinkStatus::Ok) {
+  if (app.uplinkResult == UplinkResult::Ok) {
+    app.lastUplinkOkMs = now;
     LoRaWANSession session;
     if (lorawanManager.fetchSession(app, session)) {
       lorawanManager.saveSession(session);
     }
-  }
-}
-
-static void updateChgLed() {
-  // constant aan als PMU CHG of DONE ziet (USB eraan)
-  if (isChargingOrDone()) {
-    setChgLed(true);
-    nextChgLedBlinkMs = 0;
-    chgLedPulseEndMs = 0;
-    return;
+  } else if (isSessionInvalidError(st)) {
+    lorawanManager.clearSession();
+    app.joined = false;
+    app.sessionRestored = false;
+    app.joinState = JoinState::Join;
+    app.nextActionMs = now + JOIN_RETRY_MS;
   }
 
-  // niet laden/geen USB (of status NO)
-  if (!app.joined) {
-    setChgLed(false);
-    nextChgLedBlinkMs = 0;
-    chgLedPulseEndMs = 0;
-    return;
-  }
-
-  // na join: pulse
-  uint32_t now = millis();
-
-  if (nextChgLedBlinkMs == 0) {
-    nextChgLedBlinkMs = now + CHG_LED_INTERVAL_MS;
-  }
-
-  if (chgLedPulseEndMs != 0 && now >= chgLedPulseEndMs) {
-    setChgLed(false);
-    chgLedPulseEndMs = 0;
-  }
-
-  if (now >= nextChgLedBlinkMs) {
-    setChgLed(true);
-    chgLedPulseEndMs = now + CHG_LED_PULSE_MS;
-    nextChgLedBlinkMs = now + CHG_LED_INTERVAL_MS;
-  }
+  app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
 }
 
 void setup() {
   powerManager.begin();
+  powerManager.enableGnssRail();
   displayManager.begin();
   gnssManager.begin();
   disableRadios();
 
-  app.gate = RunGate::WaitingForBoot;
-  pinMode(BOOT_PIN, INPUT_PULLUP);
-
-  app.joinStatus = JoinStatus::Boot;
-  app.nextJoinAttemptMs = millis();
+  bootGate.begin();
+  resetJoinState();
 }
 
 void loop() {
   gnssManager.update();
+  bootGate.update();
 
-  updateStartGate();
-
-  if (app.gate == RunGate::Running) {
-    updateJoinFlow();
-    updateUplinkFlow();
+  if (bootGate.gateOpen && app.gate != GateState::Running) {
+    app.gate = GateState::Running;
+    resetJoinState();
   }
 
-  updateChgLed();
+  updateJoinFlow();
+  updateUplinkFlow();
 
+  static uint32_t lastDrawMs = 0;
   uint32_t now = millis();
   if (now - lastDrawMs >= 250) {
     lastDrawMs = now;
-
     uint16_t battMv = readBatteryMv();
-    int chgRaw = chargerStatusRaw();
-
-    bool vbus = hasVbus();
-    uint16_t vbusMv = readVbusMv();
-
     uint8_t battPct = readBatteryPercent();
-    displayManager.render(app, gps, battMv, battPct, chgRaw, vbus, vbusMv);
+    GpsSnapshot snap = readGpsSnapshot();
+    displayManager.render(app, snap, battMv, battPct);
   }
 }
