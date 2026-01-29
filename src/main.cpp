@@ -72,32 +72,6 @@ using LoRaWANSession = LoRaWANSchemeSession_t;
 #define RADIOLIB_ERR_UNSUPPORTED RADIOLIB_ERR_UNKNOWN
 #endif
 
-// ---- compile-time checks ----
-#include <type_traits>
-#include <utility>
-
-template <typename T>
-struct has_getBufferNonces {
-  template <typename U>
-  static auto test(int) -> decltype(std::declval<U>().getBufferNonces(), std::true_type{});
-  template <typename>
-  static auto test(...) -> std::false_type;
-  static constexpr bool value = decltype(test<T>(0))::value;
-};
-
-template <typename T>
-struct has_setBufferNonces {
-  template <typename U>
-  static auto test(int) -> decltype(std::declval<U>().setBufferNonces((const uint8_t*)nullptr), std::true_type{});
-  template <typename>
-  static auto test(...) -> std::false_type;
-  static constexpr bool value = decltype(test<T>(0))::value;
-};
-
-static_assert(has_getBufferNonces<decltype(node)>::value, "node heeft GEEN getBufferNonces()");
-static_assert(has_setBufferNonces<decltype(node)>::value, "node heeft GEEN setBufferNonces(const uint8_t*)");
-
-
 enum class GateState : uint8_t {
 	WaitingForBoot,
 	Running
@@ -131,8 +105,7 @@ struct AppState {
 	bool radioReady = false;
 	bool joined = false;
 	bool sessionRestored = false;
-	uint16_t lastDevNonce = 0;
-	int16_t lastDevNonceSetErr = 0;
+	uint8_t testUplinkBackoff = 0;
 };
 
 static AppState app;
@@ -343,10 +316,6 @@ struct DisplayManager {
 		}
 		u8g2.drawStr(0, 54, line);
 
-		snprintf(line, sizeof(line), "DN %u set %d", (unsigned)state.lastDevNonce, (int)state.lastDevNonceSetErr);
-		u8g2.drawStr(0, 60, line);
-
-
 		u8g2.sendBuffer();
 	}
 };
@@ -385,11 +354,7 @@ struct StoredSession {
 };
 
 // ---- LoRaWAN Manager ----
-// ---- LoRaWAN Manager ----
-// Drop-in replacement: session + NONCES buffer persistence (RadioLib v7.5.x style)
-// - bewaart session zoals je al deed
-// - bewaart óók LoRaWAN nonces buffer in NVS key "nonces"
-// - gebruikt DevNonce setters NIET meer (die geven bij jou -25)
+// Session-only persistence (RadioLib v7.5.x)
 struct LoRaWanManager {
   // ---------- Session storage ----------
   static bool loadSession(LoRaWANSession& session) {
@@ -428,7 +393,6 @@ struct LoRaWanManager {
     Preferences prefs;
     if (!prefs.begin("lorawan", false)) return;
     prefs.remove("session");
-    prefs.remove("nonces");   // <-- belangrijk: nonces ook weggooien als je "reset"
     prefs.end();
   }
 
@@ -465,40 +429,6 @@ struct LoRaWanManager {
   template <typename NodeT, typename SessionT>
   static int16_t getNodeSession(NodeT&, SessionT&, ...) {
     return RADIOLIB_ERR_UNSUPPORTED;
-  }
-
-  // ---------- Nonces buffer persistence (RadioLib v7.x) ----------
-  // SFINAE helpers to avoid compile errors if your build lacks these methods/macros
-  template <typename NodeT>
-  static auto nodeGetBufferNonces(NodeT& n, int) -> decltype(n.getBufferNonces()) {
-    return n.getBufferNonces();
-  }
-  template <typename NodeT>
-  static uint8_t* nodeGetBufferNonces(NodeT&, ...) { return nullptr; }
-
-  template <typename NodeT>
-  static auto nodeSetBufferNonces(NodeT& n, const uint8_t* buf, int) -> decltype(n.setBufferNonces(buf), void()) {
-    n.setBufferNonces(buf);
-  }
-  template <typename NodeT>
-  static void nodeSetBufferNonces(NodeT&, const uint8_t*, ...) {}
-
-  static bool loadNonces(uint8_t* out, size_t len) {
-    Preferences prefs;
-    if (!prefs.begin("lorawan", true)) return false;
-    size_t storedLen = prefs.getBytesLength("nonces");
-    if (storedLen != len) { prefs.end(); return false; }
-    size_t r = prefs.getBytes("nonces", out, len);
-    prefs.end();
-    return r == len;
-  }
-
-  static bool saveNonces(const uint8_t* in, size_t len) {
-    Preferences prefs;
-    if (!prefs.begin("lorawan", false)) return false;
-    size_t w = prefs.putBytes("nonces", in, len);
-    prefs.end();
-    return w == len;
   }
 
   // ---------- Radio init ----------
@@ -540,58 +470,26 @@ struct LoRaWanManager {
     return true;
   }
 
-  // ---------- OTAA join (with NONCES buffer persistence) ----------
+  // ---------- OTAA join ----------
   bool join(AppState& state) {
-    // reset debug fields
-    state.lastDevNonce = 0;
-    state.lastDevNonceSetErr = 0;
-
     // 1) init OTAA
     int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
     if (st != RADIOLIB_ERR_NONE) {
       state.lastLoraErr = st;
-      state.lastDevNonceSetErr = st;
       return false;
     }
 
-    // 2) restore nonces buffer if we can
-#if defined(RADIOLIB_LORAWAN_NONCES_BUF_SIZE)
-    {
-      uint8_t buf[RADIOLIB_LORAWAN_NONCES_BUF_SIZE];
-      if (loadNonces(buf, sizeof(buf))) {
-        nodeSetBufferNonces(node, buf, 0);
-        // “set ok” indicator (best-effort)
-        state.lastDevNonceSetErr = RADIOLIB_ERR_NONE;
-      } else {
-        // niet fout: gewoon geen stored nonces gevonden
-        state.lastDevNonceSetErr = RADIOLIB_ERR_NONE;
-      }
-    }
-#else
-    // jouw lib build heeft de nonces-buf macro niet -> dan kun je dit niet persistent maken op compile-time
-    state.lastDevNonceSetErr = RADIOLIB_ERR_UNSUPPORTED;
-#endif
-
-    // 3) join
+    // 2) join
     st = node.activateOTAA();
     if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
       state.lastLoraErr = st;
       return false;
     }
 
-    // 4) save nonces buffer after successful join
-#if defined(RADIOLIB_LORAWAN_NONCES_BUF_SIZE)
-    {
-      uint8_t* noncesPtr = nodeGetBufferNonces(node, 0);
-      if (noncesPtr) {
-        (void)saveNonces(noncesPtr, RADIOLIB_LORAWAN_NONCES_BUF_SIZE);
-
-        // debug: laat “iets” oplopen op OLED (geen garantie welke bytes DevNonce zijn, maar handig als heartbeat)
-        // neem de eerste 2 bytes als teller (little-endian)
-        state.lastDevNonce = (uint16_t)(noncesPtr[0] | (uint16_t(noncesPtr[1]) << 8));
-      }
+    LoRaWANSession session;
+    if (fetchSession(state, session)) {
+      (void)saveSession(session);
     }
-#endif
 
     state.lastLoraErr = RADIOLIB_ERR_NONE;
     return true;
@@ -651,7 +549,7 @@ static bool isSessionInvalidError(int16_t err) {
 }
 
 static bool isUplinkOkError(int16_t err) {
-	return err == RADIOLIB_ERR_NONE || isTimeoutErr(err);
+	return err == RADIOLIB_ERR_NONE;
 }
 
 static size_t buildPayload(uint8_t* out, size_t maxLen, const GpsSnapshot& gpsSnap) {
@@ -805,6 +703,7 @@ static void resetJoinState() {
 	app.radioReady = false;
 	app.joined = false;
 	app.sessionRestored = false;
+	app.testUplinkBackoff = 0;
 }
 
 static void updateJoinFlow() {
@@ -835,6 +734,7 @@ static void updateJoinFlow() {
 			if (lorawanManager.loadSession(session) &&
 					lorawanManager.restoreSession(app, session)) {
 				app.sessionRestored = true;
+				app.testUplinkBackoff = 0;
 				app.joinState = JoinState::TestUplink;
 				app.nextActionMs = now + RESTORE_TEST_DELAY_MS;
 			} else {
@@ -857,6 +757,7 @@ static void updateJoinFlow() {
 			if (app.uplinkResult == UplinkResult::Ok) {
 				app.joined = true;
 				app.joinState = JoinState::Ok;
+				app.testUplinkBackoff = 0;
 
 				LoRaWANSession saved;
 				if (lorawanManager.fetchSession(app, saved)) {
@@ -864,13 +765,20 @@ static void updateJoinFlow() {
 				}
 
 				app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
-			} else {
-				// restore-test faalt => session als stale behandelen en schone OTAA forceren
+			} else if (isSessionInvalidError(st)) {
+				// echte sessie-fout: session wissen en opnieuw joinen
 				lorawanManager.clearSession();
 				app.sessionRestored = false;
 
 				app.joinState = JoinState::Join;
 				app.nextActionMs = now;
+			} else {
+				if (app.testUplinkBackoff < 5) {
+					app.testUplinkBackoff++;
+				}
+				uint32_t backoffMs = JOIN_RETRY_MS + (uint32_t)app.testUplinkBackoff * 10000;
+				app.joinState = JoinState::TestUplink;
+				app.nextActionMs = now + backoffMs;
 			}
 			break;
 		}
@@ -886,10 +794,7 @@ static void updateJoinFlow() {
 			if (ok) {
 				app.joined = true;
 				app.joinState = JoinState::Ok;
-				LoRaWANSession session;
-				if (lorawanManager.fetchSession(app, session)) {
-					lorawanManager.saveSession(session);
-				}
+				app.testUplinkBackoff = 0;
 				app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
 			} else {
 				app.joinState = JoinState::Join;
