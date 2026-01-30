@@ -171,6 +171,12 @@ static uint16_t readBatteryMv() {
 	return (uint16_t)lroundf(v);
 }
 
+static float readBatteryVoltageV() {
+	uint16_t mv = readBatteryMv();
+	if (mv == 0) return 0.0f;
+	return (float)mv / 1000.0f;
+}
+
 static uint8_t readBatteryPercent() {
 	if (!axp.isBatteryConnect()) return 0;
 	return (uint8_t)axp.getBatteryPercent();
@@ -275,9 +281,15 @@ struct DisplayManager {
 		char line[32];
 
 		// 1) Battery
-		snprintf(line, sizeof(line), "BAT %umV %u%%",
-						 (unsigned)battMv,
-						 (unsigned)battPct);
+		float battV = readBatteryVoltageV();
+		if (battV > 0.0f) {
+			snprintf(line, sizeof(line), "BAT %.2fV %u%%",
+							 (double)battV,
+							 (unsigned)battPct);
+		} else {
+			snprintf(line, sizeof(line), "BAT --.-V %u%%",
+							 (unsigned)battPct);
+		}
 		u8g2.drawStr(0, 12, line);
 
 		if (state.gate != GateState::Running) {
@@ -336,15 +348,14 @@ struct DisplayManager {
 		// 3) GPS diagnostics
 		if (gpsSnap.charsPerSec == 0) {
 			snprintf(line, sizeof(line), "GPS NO UART");
+		} else if (gpsSnap.fix) {
+			snprintf(line, sizeof(line), "lt=%.2f ln=%.2f s=%u h=%.1f",
+							 gpsSnap.lat,
+							 gpsSnap.lon,
+							 (unsigned)gpsSnap.sats,
+							 (double)(gpsSnap.hdop / 100.0f));
 		} else {
-				const char* v = gpsSnap.locationValid ? "VAL" : "NOVAL";
-				const char* f = gpsSnap.fix ? "FIX" : "NOFIX";
-				snprintf(line, sizeof(line), "GPS %uc/s S%u H%.1f A%lus %s %s",
-					(unsigned)gpsSnap.charsPerSec,
-					(unsigned)gpsSnap.sats,
-					(double)(gpsSnap.hdop / 100.0f),
-					(unsigned)(gpsSnap.ageMs / 1000),
-					v, f);
+			snprintf(line, sizeof(line), "NMEA output");
 		}
 		u8g2.drawStr(0, 54, line);
 
@@ -362,10 +373,44 @@ struct DisplayManager {
 // ---- GNSS Manager ----
 // ---- GNSS Manager ----
 struct GnssManager {
+  static void drainUart(uint32_t ms = 150) {
+    uint32_t start = millis();
+    while (millis() - start < ms) {
+      while (GNSS.available()) (void)GNSS.read();
+      delay(1);
+    }
+  }
+
+  static void configureL76kNmea() {
+    // 1) Stop alle NMEA (zodat responses niet verdrinken)
+    GNSS.write("$PCAS03,0,0,0,0,0,0,0,0,0,0,,,0,0*02\r\n");
+    delay(60);
+    drainUart(120);
+
+    // 2) Vraag versie (GPTXT...)
+    GNSS.write("$PCAS06,0*1B\r\n");
+    delay(80);
+
+    // 3) Constellation: GPS+GLONASS
+    GNSS.write("$PCAS04,5*1C\r\n");
+    delay(120);
+
+    // 4) Vehicle mode
+    GNSS.write("$PCAS11,3*1E\r\n");
+    delay(120);
+
+    // 5) NMEA weer aan: alleen GGA + RMC (zoals voorbeeld)
+    GNSS.write("$PCAS03,1,0,0,0,1,0,0,0,0,0,,,0,0*02\r\n");
+    delay(120);
+
+    Serial.println("GNSS: L76K init done (RMC+GGA).");
+  }
+
   void begin() {
     GNSS.setRxBufferSize(2048);          // helpt tegen overflow
     GNSS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
-    while (GNSS.available()) GNSS.read(); // flush rommel
+    drainUart(150); // flush rommel
+    configureL76kNmea();
   }
 
   void update() {
