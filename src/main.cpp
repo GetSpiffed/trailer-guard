@@ -33,6 +33,8 @@ static constexpr uint32_t GNSS_BAUD = 9600;
 
 // ---------------- BOOT button ----------------
 static constexpr uint8_t BOOT_PIN = 0; // Button1 (BOOT)
+static constexpr uint32_t FORCE_OTAA_MIN_MS = 2000;
+static constexpr uint32_t FORCE_OTAA_MAX_MS = 6000;
 
 // ---------------- T-Beam S3 Supreme SX1262 pinmap ----------------
 static constexpr int LORA_SCK	= 12;
@@ -92,6 +94,11 @@ enum class UplinkResult : uint8_t {
 	Idle,
 	Ok,
 	Fail
+};
+
+enum class BootAction : uint8_t {
+	Normal,
+	ForceOTAA
 };
 
 struct AppState {
@@ -322,6 +329,13 @@ struct DisplayManager {
 		}
 		u8g2.drawStr(0, 54, line);
 
+		u8g2.sendBuffer();
+	}
+
+	void showModeMessage(const char* line) {
+		u8g2.clearBuffer();
+		u8g2.setFont(u8g2_font_6x10_tf);
+		u8g2.drawStr(0, 30, line);
 		u8g2.sendBuffer();
 	}
 };
@@ -650,6 +664,12 @@ struct BootGate {
 		initialized = true;
 	}
 
+	void forceOpen() {
+		gateOpen = true;
+		state = State::Open;
+		initialized = true;
+	}
+
 	void update() {
 		if (gateOpen || state == State::Open) return;
 		if (!initialized) begin();
@@ -703,6 +723,26 @@ struct BootGate {
 };
 
 static BootGate bootGate;
+
+static BootAction detectBootAction() {
+	pinMode(BOOT_PIN, INPUT_PULLUP);
+	if (digitalRead(BOOT_PIN) != LOW) return BootAction::Normal;
+
+	uint32_t startMs = millis();
+	while (digitalRead(BOOT_PIN) == LOW) {
+		uint32_t elapsed = millis() - startMs;
+		if (elapsed > FORCE_OTAA_MAX_MS) {
+			return BootAction::Normal;
+		}
+		delay(10);
+	}
+
+	uint32_t heldMs = millis() - startMs;
+	if (heldMs >= FORCE_OTAA_MIN_MS && heldMs <= FORCE_OTAA_MAX_MS) {
+		return BootAction::ForceOTAA;
+	}
+	return BootAction::Normal;
+}
 
 static void resetJoinState() {
 	app.joinState = JoinState::Radio;
@@ -860,7 +900,18 @@ void setup() {
 	gnssManager.begin();
 	disableRadios();
 
+	BootAction bootAction = detectBootAction();
+	if (bootAction == BootAction::ForceOTAA) {
+		lorawanManager.clearSession();
+		displayManager.showModeMessage("MODE: FORCE OTAA");
+		delay(1500);
+	}
+
 	bootGate.begin();
+	if (bootAction == BootAction::ForceOTAA) {
+		bootGate.forceOpen();
+		app.gate = GateState::Running;
+	}
 	resetJoinState();
 }
 
