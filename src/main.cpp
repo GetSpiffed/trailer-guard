@@ -1,3 +1,4 @@
+// GNSS refactor: AXP2101 ALDO4 + Serial2 + PCAS init + TinyGPSPlus + OLED fix/no-fix view
 #include <Arduino.h>
 #include <Wire.h>
 #include <XPowersLib.h>
@@ -12,10 +13,8 @@
 
 #include "secrets.h"
 
-
-
 // ---------------- PMU bus ----------------
-TwoWire I2C_PMU(0);
+TwoWire Wire1_PMU(0);
 static constexpr uint8_t PMU_SDA = 42;
 static constexpr uint8_t PMU_SCL = 41;
 
@@ -25,10 +24,10 @@ static constexpr uint8_t DEV_SCL = 18;
 
 // ---------------- GNSS UART ----------------
 // Board docs: GNSS TX = GPIO8, GNSS RX = GPIO9
-// HardwareSerial.begin(baud, config, RX, TX): RX must be GPIO8, TX must be GPIO9
-static constexpr uint8_t GNSS_RX_PIN = 8;	// ESP32 RX <- GNSS TX
-static constexpr uint8_t GNSS_TX_PIN = 9;	// ESP32 TX -> GNSS RX
-static constexpr uint8_t GNSS_WAKE_PIN = 7; // L76K wake-up
+// HardwareSerial.begin(baud, config, RX, TX): RX must be GPIO9, TX must be GPIO8
+static constexpr uint8_t GNSS_RX_PIN = 9; // ESP32 RX <- GNSS TX
+static constexpr uint8_t GNSS_TX_PIN = 8; // ESP32 TX -> GNSS RX
+static constexpr uint8_t GPS_EN_PIN = 7;  // L76K enable
 static constexpr uint32_t GNSS_BAUD = 9600;
 
 static constexpr uint8_t GNSS_PPS_PIN = 6; // per LilyGO wiki
@@ -36,39 +35,33 @@ static volatile uint32_t ppsCount = 0;
 
 static void IRAM_ATTR onPpsRise() { ppsCount++; }
 
-
 // ---------------- BOOT button ----------------
 static constexpr uint8_t BOOT_PIN = 0; // Button1 (BOOT)
 static constexpr uint32_t FORCE_OTAA_MIN_MS = 2000;
 static constexpr uint32_t FORCE_OTAA_MAX_MS = 6000;
 
 // ---------------- T-Beam S3 Supreme SX1262 pinmap ----------------
-static constexpr int LORA_SCK	= 12;
+static constexpr int LORA_SCK = 12;
 static constexpr int LORA_MISO = 13;
 static constexpr int LORA_MOSI = 11;
-static constexpr int LORA_CS	 = 10;
-static constexpr int LORA_RST	= 5;
+static constexpr int LORA_CS = 10;
+static constexpr int LORA_RST = 5;
 static constexpr int LORA_DIO1 = 1;
 static constexpr int LORA_BUSY = 4;
 
 // ---------------- App settings (tunable) ----------------
-static constexpr uint8_t	LORAWAN_FPORT = 1;
+static constexpr uint8_t LORAWAN_FPORT = 1;
 static constexpr uint32_t UPLINK_INTERVAL_MS = 60000;
 static constexpr uint32_t JOIN_RETRY_MS = 10000;
 static constexpr uint32_t RESTORE_TEST_DELAY_MS = 2000;
-static constexpr uint8_t	JOIN_MAX_ATTEMPTS = 8;
-static constexpr uint8_t	RADIO_INIT_MAX_ATTEMPTS = 5;
-static constexpr float		RADIO_TCXO_VOLTAGE = 1.6f;
+static constexpr uint8_t JOIN_MAX_ATTEMPTS = 8;
+static constexpr uint8_t RADIO_INIT_MAX_ATTEMPTS = 5;
+static constexpr float RADIO_TCXO_VOLTAGE = 1.6f;
 
 // ---------------- Globals ----------------
 XPowersAXP2101 axp;
-HardwareSerial GNSS(2);
+HardwareSerial SerialGPS(2);
 TinyGPSPlus gps;
-
-// GPS stats (voor OLED diagnose)
-static uint32_t gpsChars = 0;
-static uint32_t gpsLastStatsMs = 0;
-static uint16_t gpsCharsPerSec = 0;
 
 // OLED: SH1106 128x64, SW I2C met expliciete pins
 U8G2_SH1106_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, DEV_SCL, DEV_SDA, U8X8_PIN_NONE);
@@ -125,9 +118,8 @@ struct AppState {
 
 static AppState app;
 
-// ---------- GPS snapshot (cache TinyGPSPlus reads) ----------
+// ---------- GNSS snapshot (cache TinyGPSPlus reads) ----------
 struct GpsSnapshot {
-	uint16_t charsPerSec = 0;
 	uint8_t sats = 0;
 	uint16_t hdop = 9999; // in hundredths
 	uint32_t ageMs = 999999;
@@ -135,6 +127,7 @@ struct GpsSnapshot {
 	double lat = 0.0;
 	double lon = 0.0;
 	float speedKmph = 0.0f;
+	float courseDeg = 0.0f;
 	bool fix = false;
 };
 
@@ -147,7 +140,6 @@ static inline bool gpsFixPolicy(uint32_t ageMs, uint16_t hdop, uint8_t sats) {
 
 static GpsSnapshot readGpsSnapshot() {
 	GpsSnapshot snap;
-	snap.charsPerSec = gpsCharsPerSec;
 	snap.sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
 	snap.hdop = gps.hdop.isValid() ? gps.hdop.value() : 9999;
 	bool locValid = gps.location.isValid();
@@ -158,6 +150,7 @@ static GpsSnapshot readGpsSnapshot() {
 		snap.lon = gps.location.lng();
 	}
 	snap.speedKmph = gps.speed.isValid() ? gps.speed.kmph() : 0.0f;
+	snap.courseDeg = gps.course.isValid() ? gps.course.deg() : 0.0f;
 	snap.fix = gpsFixPolicy(snap.ageMs, snap.hdop, snap.sats);
 	return snap;
 }
@@ -192,9 +185,15 @@ static void updateChargeLed() {
 // ---- PowerManager (AXP2101) ----
 struct PowerManager {
 	bool begin() {
-		I2C_PMU.begin(PMU_SDA, PMU_SCL);
-		bool ok = axp.begin(I2C_PMU, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL);
+		Wire1_PMU.begin(PMU_SDA, PMU_SCL);
+		bool ok = axp.begin(Wire1_PMU, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL);
 		if (!ok) return false;
+
+		axp.enableSystemVoltageMeasure();
+		axp.enableVbusVoltageMeasure();
+		axp.enableBattVoltageMeasure();
+		axp.enableBattDetection();
+		axp.enableTemperatureMeasure();
 
 		axp.setALDO1Voltage(3300);
 		axp.enableALDO1();
@@ -208,22 +207,10 @@ struct PowerManager {
 	void enableGnssRail() {
 		axp.setALDO4Voltage(3300);
 		axp.enableALDO4();
-
-		pinMode(GNSS_WAKE_PIN, OUTPUT);
-		digitalWrite(GNSS_WAKE_PIN, LOW);      // <— fix: LOW vasthouden
-		delay(50);
-
-		Serial.printf("WAKE raw=%d (expected 0)\n", digitalRead(GNSS_WAKE_PIN));
-		Serial.printf("AXP: VBUS=%d BattConn=%d BattV=%.2f\n",
-									axp.isVbusIn(),
-									axp.isBatteryConnect(),
-									axp.getBattVoltage());
-
-		delay(500);
 	}
-
-
 };
+
+static void gnss_render_oled(const GpsSnapshot& gpsSnap);
 
 // ---- DisplayManager (OLED) ----
 struct DisplayManager {
@@ -234,47 +221,56 @@ struct DisplayManager {
 
 	static const char* joinStateText(JoinState state) {
 		switch (state) {
-			case JoinState::Radio:			return "RADIO";
-			case JoinState::Restore:		return "RESTORE";
+			case JoinState::Radio: return "RADIO";
+			case JoinState::Restore: return "RESTORE";
 			case JoinState::TestUplink: return "TESTUP";
-			case JoinState::Join:			 return "JOIN";
-			case JoinState::Ok:				 return "OK";
-			case JoinState::Fail:			 return "FAIL";
-			default:										return "?";
+			case JoinState::Join: return "JOIN";
+			case JoinState::Ok: return "OK";
+			case JoinState::Fail: return "FAIL";
+			default: return "?";
 		}
 	}
 
 	static const char* loraErrLabel(int16_t err, bool uplinkOk) {
 		if (uplinkOk) return "OK";
 		switch (err) {
-			case RADIOLIB_ERR_NONE: return "NONE";
+			case RADIOLIB_ERR_NONE:
+				return "NONE";
 #ifdef RADIOLIB_ERR_JOIN_FAILED
-			case RADIOLIB_ERR_JOIN_FAILED: return "JOIN_FAILED";
+			case RADIOLIB_ERR_JOIN_FAILED:
+				return "JOIN_FAILED";
 #endif
 #ifdef RADIOLIB_ERR_NO_JOIN_ACCEPT
-			case RADIOLIB_ERR_NO_JOIN_ACCEPT: return "NO_ACCEPT";
+			case RADIOLIB_ERR_NO_JOIN_ACCEPT:
+				return "NO_ACCEPT";
 #endif
 #ifdef RADIOLIB_ERR_RX_TIMEOUT
-			case RADIOLIB_ERR_RX_TIMEOUT: return "TIMEOUT";
+			case RADIOLIB_ERR_RX_TIMEOUT:
+				return "TIMEOUT";
 #endif
 #ifdef RADIOLIB_ERR_TIMEOUT
-			case RADIOLIB_ERR_TIMEOUT: return "TIMEOUT";
+			case RADIOLIB_ERR_TIMEOUT:
+				return "TIMEOUT";
 #endif
 #ifdef RADIOLIB_ERR_MIC_MISMATCH
-			case RADIOLIB_ERR_MIC_MISMATCH: return "MIC_MISMATCH";
+			case RADIOLIB_ERR_MIC_MISMATCH:
+				return "MIC_MISMATCH";
 #endif
 #ifdef RADIOLIB_ERR_INVALID_FCNT
-			case RADIOLIB_ERR_INVALID_FCNT: return "INVALID_FCNT";
+			case RADIOLIB_ERR_INVALID_FCNT:
+				return "INVALID_FCNT";
 #endif
 #ifdef RADIOLIB_ERR_DOWNLINK_MALFORMED
-			case RADIOLIB_ERR_DOWNLINK_MALFORMED: return "DOWNLINK_BAD";
+			case RADIOLIB_ERR_DOWNLINK_MALFORMED:
+				return "DOWNLINK_BAD";
 #endif
-			default: return "OTHER";
+			default:
+				return "OTHER";
 		}
 	}
 
-	void render(const AppState& state, const GpsSnapshot& gpsSnap,
-							uint16_t battMv, uint8_t battPct) {
+	void render(const AppState& state, const GpsSnapshot& gpsSnap, uint16_t battMv,
+								 uint8_t battPct) {
 		u8g2.clearBuffer();
 		u8g2.setFont(u8g2_font_6x10_tf);
 
@@ -283,12 +279,10 @@ struct DisplayManager {
 		// 1) Battery
 		float battV = readBatteryVoltageV();
 		if (battV > 0.0f) {
-			snprintf(line, sizeof(line), "BAT %.2fV %u%%",
-							 (double)battV,
-							 (unsigned)battPct);
+			snprintf(line, sizeof(line), "BAT %.2fV %u%%", (double)battV,
+						 (unsigned)battPct);
 		} else {
-			snprintf(line, sizeof(line), "BAT --.-V %u%%",
-							 (unsigned)battPct);
+			snprintf(line, sizeof(line), "BAT --.-V %u%%", (unsigned)battPct);
 		}
 		u8g2.drawStr(0, 12, line);
 
@@ -296,7 +290,6 @@ struct DisplayManager {
 			u8g2.drawStr(0, 30, "LORA: press BOOT");
 			// gewoon doorrenderen, geen return
 		}
-
 
 		uint32_t now = millis();
 		int32_t countdown = 0;
@@ -306,28 +299,19 @@ struct DisplayManager {
 
 		// 2) Join state + countdown
 		if (countdown > 0) {
-			uint8_t attempt = (state.joinState == JoinState::Radio)
-													? state.radioInitAttempts
-													: state.joinAttempts;
-			uint8_t maxAttempt = (state.joinState == JoinState::Radio)
-														 ? RADIO_INIT_MAX_ATTEMPTS
-														 : JOIN_MAX_ATTEMPTS;
-			snprintf(line, sizeof(line), "JOIN %s %u/%u T-%lds",
-							 joinStateText(state.joinState),
-							 (unsigned)attempt,
-							 (unsigned)maxAttempt,
-							 (long)countdown);
+			uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts
+																											 : state.joinAttempts;
+			uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS
+																											 : JOIN_MAX_ATTEMPTS;
+			snprintf(line, sizeof(line), "JOIN %s %u/%u T-%lds", joinStateText(state.joinState),
+						 (unsigned)attempt, (unsigned)maxAttempt, (long)countdown);
 		} else {
-			uint8_t attempt = (state.joinState == JoinState::Radio)
-													? state.radioInitAttempts
-													: state.joinAttempts;
-			uint8_t maxAttempt = (state.joinState == JoinState::Radio)
-														 ? RADIO_INIT_MAX_ATTEMPTS
-														 : JOIN_MAX_ATTEMPTS;
-			snprintf(line, sizeof(line), "JOIN %s %u/%u",
-							 joinStateText(state.joinState),
-							 (unsigned)attempt,
-							 (unsigned)maxAttempt);
+			uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts
+																											 : state.joinAttempts;
+			uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS
+																											 : JOIN_MAX_ATTEMPTS;
+			snprintf(line, sizeof(line), "JOIN %s %u/%u", joinStateText(state.joinState),
+						 (unsigned)attempt, (unsigned)maxAttempt);
 		}
 
 		if (state.gate == GateState::Running) {
@@ -338,26 +322,12 @@ struct DisplayManager {
 			u8g2.drawStr(0, 42, "LORA: idle");
 		} else {
 			bool uplinkOk = (state.uplinkResult == UplinkResult::Ok);
-			snprintf(line, sizeof(line), "LORA %d %s",
-							(int)state.lastLoraErr,
-							loraErrLabel(state.lastLoraErr, uplinkOk));
+			snprintf(line, sizeof(line), "LORA %d %s", (int)state.lastLoraErr,
+						 loraErrLabel(state.lastLoraErr, uplinkOk));
 			u8g2.drawStr(0, 42, line);
 		}
 
-
-		// 3) GPS diagnostics
-		if (gpsSnap.charsPerSec == 0) {
-			snprintf(line, sizeof(line), "GPS NO UART");
-		} else if (gpsSnap.fix) {
-			snprintf(line, sizeof(line), "lt=%.2f ln=%.2f s=%u h=%.1f",
-							 gpsSnap.lat,
-							 gpsSnap.lon,
-							 (unsigned)gpsSnap.sats,
-							 (double)(gpsSnap.hdop / 100.0f));
-		} else {
-			snprintf(line, sizeof(line), "NMEA output");
-		}
-		u8g2.drawStr(0, 54, line);
+		gnss_render_oled(gpsSnap);
 
 		u8g2.sendBuffer();
 	}
@@ -370,74 +340,150 @@ struct DisplayManager {
 	}
 };
 
-// ---- GNSS Manager ----
-// ---- GNSS Manager ----
-struct GnssManager {
-  static void drainUart(uint32_t ms = 150) {
-    uint32_t start = millis();
-    while (millis() - start < ms) {
-      while (GNSS.available()) (void)GNSS.read();
-      delay(1);
-    }
-  }
-
-  static void configureL76kNmea() {
-    // 1) Stop alle NMEA (zodat responses niet verdrinken)
-    GNSS.write("$PCAS03,0,0,0,0,0,0,0,0,0,0,,,0,0*02\r\n");
-    delay(60);
-    drainUart(120);
-
-    // 2) Vraag versie (GPTXT...)
-    GNSS.write("$PCAS06,0*1B\r\n");
-    delay(80);
-
-    // 3) Constellation: GPS+GLONASS
-    GNSS.write("$PCAS04,5*1C\r\n");
-    delay(120);
-
-    // 4) Vehicle mode
-    GNSS.write("$PCAS11,3*1E\r\n");
-    delay(120);
-
-    // 5) NMEA weer aan: alleen GGA + RMC (zoals voorbeeld)
-    GNSS.write("$PCAS03,1,0,0,0,1,0,0,0,0,0,,,0,0*02\r\n");
-    delay(120);
-
-    Serial.println("GNSS: L76K init done (RMC+GGA).");
-  }
-
-  void begin() {
-    GNSS.setRxBufferSize(2048);          // helpt tegen overflow
-    GNSS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
-    drainUart(150); // flush rommel
-    configureL76kNmea();
-  }
-
-  void update() {
-    while (GNSS.available()) {
-      char c = (char)GNSS.read();
-      gpsChars++;
-
-      // NMEA start-char detectie (veelzeggender dan random 1 byte)
-      if (c == '$') {
-        Serial.println("GNSS: saw '$' (NMEA start)");
-      }
-
-      // zet raw dump UIT (kan timing slopen)
-      // Serial.write(c);
-
-      gps.encode(c);
-    }
-
-    uint32_t now = millis();
-    if (now - gpsLastStatsMs >= 1000) {
-      gpsCharsPerSec = (uint16_t)gpsChars;
-      gpsChars = 0;
-      gpsLastStatsMs = now;
-    }
-  }
+// ---- GNSS module ----
+struct GnssState {
+	char lastNmea[96] = {0};
+	char lineBuffer[96] = {0};
+	uint8_t lineIndex = 0;
+	bool hasNmea = false;
+	uint32_t lastAnyByteMs = 0;
+	uint32_t lastOledMs = 0;
+	char oledLine1[32] = {0};
+	char oledLine2[32] = {0};
 };
 
+static GnssState gnss;
+static PowerManager powerManager;
+static DisplayManager displayManager;
+
+static bool beginPower_AXP2101_Wire1() {
+	if (!powerManager.begin()) {
+		return false;
+	}
+	return true;
+}
+
+static void gpsEnableHigh() {
+	pinMode(GPS_EN_PIN, OUTPUT);
+	digitalWrite(GPS_EN_PIN, HIGH);
+	delay(350);
+}
+
+static void gnssDrainUart(uint32_t ms = 150) {
+	uint32_t start = millis();
+	while (millis() - start < ms) {
+		while (SerialGPS.available()) {
+			(void)SerialGPS.read();
+		}
+		delay(1);
+	}
+}
+
+static void gpsBegin() {
+	SerialGPS.end();
+	delay(20);
+	SerialGPS.setRxBufferSize(4096);
+	SerialGPS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
+	gnssDrainUart(150);
+}
+
+static void l76kInitAndEnableNmea() {
+	SerialGPS.write("$PCAS03,0,0,0,0,0,0,0,0,0,0,,,0,0*02\r\n");
+	delay(60);
+	gnssDrainUart(120);
+
+	SerialGPS.write("$PCAS06,0*1B\r\n");
+	delay(80);
+
+	SerialGPS.write("$PCAS04,5*1C\r\n");
+	delay(120);
+
+	SerialGPS.write("$PCAS11,3*1E\r\n");
+	delay(120);
+
+	SerialGPS.write("$PCAS03,1,0,0,0,1,0,0,0,0,0,,,0,0*02\r\n");
+	delay(120);
+}
+
+static bool gnss_init() {
+	if (!beginPower_AXP2101_Wire1()) {
+		Serial.println("PMU init failed");
+		return false;
+	}
+	powerManager.enableGnssRail();
+	gpsEnableHigh();
+	gpsBegin();
+	l76kInitAndEnableNmea();
+	gnss.lastAnyByteMs = millis();
+	return true;
+}
+
+static void gnss_poll() {
+	while (SerialGPS.available()) {
+		char c = (char)SerialGPS.read();
+		gnss.lastAnyByteMs = millis();
+		gps.encode(c);
+
+		if (c == '$') {
+			gnss.lineIndex = 0;
+		}
+
+		if (gnss.lineIndex < sizeof(gnss.lineBuffer) - 1) {
+			if (c != '\n') {
+				gnss.lineBuffer[gnss.lineIndex++] = c;
+			}
+		}
+
+		if (c == '\n') {
+			while (gnss.lineIndex > 0 && gnss.lineBuffer[gnss.lineIndex - 1] == '\r') {
+				gnss.lineIndex--;
+			}
+			gnss.lineBuffer[gnss.lineIndex] = '\0';
+			if (gnss.lineIndex > 0) {
+				strncpy(gnss.lastNmea, gnss.lineBuffer, sizeof(gnss.lastNmea) - 1);
+				gnss.lastNmea[sizeof(gnss.lastNmea) - 1] = '\0';
+				gnss.hasNmea = true;
+			}
+			gnss.lineIndex = 0;
+		}
+	}
+}
+
+static void gnss_render_oled(const GpsSnapshot& gpsSnap) {
+	uint32_t now = millis();
+	uint32_t interval = gpsSnap.fix ? 250 : 500;
+
+	if (now - gnss.lastOledMs >= interval || gnss.lastOledMs == 0) {
+		gnss.lastOledMs = now;
+		if (gpsSnap.fix) {
+			snprintf(gnss.oledLine1, sizeof(gnss.oledLine1), "FIX s=%u h=%.1f",
+						 (unsigned)gpsSnap.sats, (double)(gpsSnap.hdop / 100.0f));
+			snprintf(gnss.oledLine2, sizeof(gnss.oledLine2), "lt=%.5f ln=%.5f",
+						 gpsSnap.lat, gpsSnap.lon);
+			if (gpsSnap.speedKmph > 0.1f || gpsSnap.courseDeg > 0.1f) {
+				char extra[24];
+				snprintf(extra, sizeof(extra), " spd=%.0f cr=%.0f",
+							 (double)gpsSnap.speedKmph, (double)gpsSnap.courseDeg);
+				strncat(gnss.oledLine2, extra,
+						 sizeof(gnss.oledLine2) - strlen(gnss.oledLine2) - 1);
+			}
+		} else {
+			snprintf(gnss.oledLine1, sizeof(gnss.oledLine1), "NO FIX s=%u h=%.1f",
+						 (unsigned)gpsSnap.sats, (double)(gpsSnap.hdop / 100.0f));
+			if (gnss.hasNmea) {
+				strncpy(gnss.oledLine2, gnss.lastNmea, sizeof(gnss.oledLine2) - 1);
+				gnss.oledLine2[sizeof(gnss.oledLine2) - 1] = '\0';
+			} else {
+				strncpy(gnss.oledLine2, "NO NMEA | check power/uart",
+							 sizeof(gnss.oledLine2) - 1);
+				gnss.oledLine2[sizeof(gnss.oledLine2) - 1] = '\0';
+			}
+		}
+	}
+
+	u8g2.drawStr(0, 54, gnss.oledLine1);
+	u8g2.drawStr(0, 64, gnss.oledLine2);
+}
 
 // ---- LoRaWAN session storage ----
 static constexpr uint32_t SESSION_MAGIC = 0x4C57534Eu; // "LWSN"
@@ -453,164 +499,172 @@ struct StoredSession {
 // ---- LoRaWAN Manager ----
 // Session-only persistence (RadioLib v7.5.x)
 struct LoRaWanManager {
-  // ---------- Session storage ----------
-  static bool loadSession(LoRaWANSession& session) {
-    Preferences prefs;
-    if (!prefs.begin("lorawan", true)) return false;
-    size_t len = prefs.getBytesLength("session");
-    if (len != sizeof(StoredSession)) {
-      prefs.end();
-      return false;
-    }
-    StoredSession stored{};
-    size_t read = prefs.getBytes("session", &stored, sizeof(stored));
-    prefs.end();
-    if (read != sizeof(stored)) return false;
-    if (stored.magic != SESSION_MAGIC) return false;
-    if (stored.version != SESSION_VERSION) return false;
-    if (stored.size != sizeof(LoRaWANSession)) return false;
-    session = stored.session;
-    return true;
-  }
+	// ---------- Session storage ----------
+	static bool loadSession(LoRaWANSession& session) {
+		Preferences prefs;
+		if (!prefs.begin("lorawan", true)) return false;
+		size_t len = prefs.getBytesLength("session");
+		if (len != sizeof(StoredSession)) {
+			prefs.end();
+			return false;
+		}
+		StoredSession stored{};
+		size_t read = prefs.getBytes("session", &stored, sizeof(stored));
+		prefs.end();
+		if (read != sizeof(stored)) return false;
+		if (stored.magic != SESSION_MAGIC) return false;
+		if (stored.version != SESSION_VERSION) return false;
+		if (stored.size != sizeof(LoRaWANSession)) return false;
+		session = stored.session;
+		return true;
+	}
 
-  static bool saveSession(const LoRaWANSession& session) {
-    Preferences prefs;
-    if (!prefs.begin("lorawan", false)) return false;
-    StoredSession stored{};
-    stored.magic = SESSION_MAGIC;
-    stored.version = SESSION_VERSION;
-    stored.size = sizeof(LoRaWANSession);
-    stored.session = session;
-    size_t written = prefs.putBytes("session", &stored, sizeof(stored));
-    prefs.end();
-    return written == sizeof(stored);
-  }
+	static bool saveSession(const LoRaWANSession& session) {
+		Preferences prefs;
+		if (!prefs.begin("lorawan", false)) return false;
+		StoredSession stored{};
+		stored.magic = SESSION_MAGIC;
+		stored.version = SESSION_VERSION;
+		stored.size = sizeof(LoRaWANSession);
+		stored.session = session;
+		size_t written = prefs.putBytes("session", &stored, sizeof(stored));
+		prefs.end();
+		return written == sizeof(stored);
+	}
 
-  static void clearSession() {
-    Preferences prefs;
-    if (!prefs.begin("lorawan", false)) return;
-    prefs.remove("session");
-    prefs.end();
-  }
+	static void clearSession() {
+		Preferences prefs;
+		if (!prefs.begin("lorawan", false)) return;
+		prefs.remove("session");
+		prefs.end();
+	}
 
-  // ---------- Session ↔ node glue (compat) ----------
-  template <typename NodeT, typename SessionT>
-  static auto setNodeSession(NodeT& target, const SessionT& session, int)
-      -> decltype(target.setSession(&session), int16_t()) {
-    return target.setSession(&session);
-  }
+	// ---------- Session ↔ node glue (compat) ----------
+	template <typename NodeT, typename SessionT>
+	static auto setNodeSession(NodeT& target, const SessionT& session, int)
+			-> decltype(target.setSession(&session), int16_t()) {
+		return target.setSession(&session);
+	}
 
-  template <typename NodeT, typename SessionT>
-  static auto setNodeSession(NodeT& target, const SessionT& session, long)
-      -> decltype(target.setSession(session), int16_t()) {
-    return target.setSession(session);
-  }
+	template <typename NodeT, typename SessionT>
+	static auto setNodeSession(NodeT& target, const SessionT& session, long)
+			-> decltype(target.setSession(session), int16_t()) {
+		return target.setSession(session);
+	}
 
-  template <typename NodeT, typename SessionT>
-  static int16_t setNodeSession(NodeT&, const SessionT&, ...) {
-    return RADIOLIB_ERR_UNSUPPORTED;
-  }
+	template <typename NodeT, typename SessionT>
+	static int16_t setNodeSession(NodeT&, const SessionT&, ...) {
+		return RADIOLIB_ERR_UNSUPPORTED;
+	}
 
-  template <typename NodeT, typename SessionT>
-  static auto getNodeSession(NodeT& target, SessionT& session, int)
-      -> decltype(target.getSession(&session), int16_t()) {
-    return target.getSession(&session);
-  }
+	template <typename NodeT, typename SessionT>
+	static auto getNodeSession(NodeT& target, SessionT& session, int)
+			-> decltype(target.getSession(&session), int16_t()) {
+		return target.getSession(&session);
+	}
 
-  template <typename NodeT, typename SessionT>
-  static auto getNodeSession(NodeT& target, SessionT& session, long)
-      -> decltype(target.getSession(session), int16_t()) {
-    return target.getSession(session);
-  }
+	template <typename NodeT, typename SessionT>
+	static auto getNodeSession(NodeT& target, SessionT& session, long)
+			-> decltype(target.getSession(session), int16_t()) {
+		return target.getSession(session);
+	}
 
-  template <typename NodeT, typename SessionT>
-  static int16_t getNodeSession(NodeT&, SessionT&, ...) {
-    return RADIOLIB_ERR_UNSUPPORTED;
-  }
+	template <typename NodeT, typename SessionT>
+	static int16_t getNodeSession(NodeT&, SessionT&, ...) {
+		return RADIOLIB_ERR_UNSUPPORTED;
+	}
 
-  // ---------- Radio init ----------
-  bool initRadio(AppState& state) {
-    SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+	// ---------- Radio init ----------
+	bool initRadio(AppState& state) {
+		SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
 
-    pinMode(LORA_RST, OUTPUT);
-    digitalWrite(LORA_RST, LOW);
-    delay(50);
-    digitalWrite(LORA_RST, HIGH);
-    delay(50);
+		pinMode(LORA_RST, OUTPUT);
+		digitalWrite(LORA_RST, LOW);
+		delay(50);
+		digitalWrite(LORA_RST, HIGH);
+		delay(50);
 
-    int16_t st = radio.begin();
-    if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
+		int16_t st = radio.begin();
+		if (st != RADIOLIB_ERR_NONE) {
+			state.lastLoraErr = st;
+			return false;
+		}
 
-    st = radio.setTCXO(RADIO_TCXO_VOLTAGE);
-    if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
+		st = radio.setTCXO(RADIO_TCXO_VOLTAGE);
+		if (st != RADIOLIB_ERR_NONE) {
+			state.lastLoraErr = st;
+			return false;
+		}
 
-    st = radio.setRegulatorDCDC();
-    if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
+		st = radio.setRegulatorDCDC();
+		if (st != RADIOLIB_ERR_NONE) {
+			state.lastLoraErr = st;
+			return false;
+		}
 
-    st = radio.setDio2AsRfSwitch(true);
-    if (st != RADIOLIB_ERR_NONE) { state.lastLoraErr = st; return false; }
+		st = radio.setDio2AsRfSwitch(true);
+		if (st != RADIOLIB_ERR_NONE) {
+			state.lastLoraErr = st;
+			return false;
+		}
 
-    radio.setOutputPower(14);
-    radio.setCurrentLimit(140);
+		radio.setOutputPower(14);
+		radio.setCurrentLimit(140);
 
-    state.lastLoraErr = RADIOLIB_ERR_NONE;
-    return true;
-  }
+		state.lastLoraErr = RADIOLIB_ERR_NONE;
+		return true;
+	}
 
-  bool restoreSession(AppState& state, const LoRaWANSession& session) {
-    int16_t st = setNodeSession(node, session, 0);
-    if (st != RADIOLIB_ERR_NONE) {
-      state.lastLoraErr = st;
-      return false;
-    }
-    state.lastLoraErr = RADIOLIB_ERR_NONE;
-    return true;
-  }
+	bool restoreSession(AppState& state, const LoRaWANSession& session) {
+		int16_t st = setNodeSession(node, session, 0);
+		if (st != RADIOLIB_ERR_NONE) {
+			state.lastLoraErr = st;
+			return false;
+		}
+		state.lastLoraErr = RADIOLIB_ERR_NONE;
+		return true;
+	}
 
-  // ---------- OTAA join ----------
-  bool join(AppState& state) {
-    // 1) init OTAA
-    int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
-    if (st != RADIOLIB_ERR_NONE) {
-      state.lastLoraErr = st;
-      return false;
-    }
+	// ---------- OTAA join ----------
+	bool join(AppState& state) {
+		// 1) init OTAA
+		int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
+		if (st != RADIOLIB_ERR_NONE) {
+			state.lastLoraErr = st;
+			return false;
+		}
 
-    // 2) join
-    st = node.activateOTAA();
-    if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
-      state.lastLoraErr = st;
-      return false;
-    }
+		// 2) join
+		st = node.activateOTAA();
+		if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
+			state.lastLoraErr = st;
+			return false;
+		}
 
-    LoRaWANSession session;
-    if (fetchSession(state, session)) {
-      (void)saveSession(session);
-    }
+		LoRaWANSession session;
+		if (fetchSession(state, session)) {
+			(void)saveSession(session);
+		}
 
-    state.lastLoraErr = RADIOLIB_ERR_NONE;
-    return true;
-  }
+		state.lastLoraErr = RADIOLIB_ERR_NONE;
+		return true;
+	}
 
-  bool fetchSession(AppState& state, LoRaWANSession& session) {
-    int16_t st = getNodeSession(node, session, 0);
-    if (st != RADIOLIB_ERR_NONE) {
-      state.lastLoraErr = st;
-      return false;
-    }
-    state.lastLoraErr = RADIOLIB_ERR_NONE;
-    return true;
-  }
+	bool fetchSession(AppState& state, LoRaWANSession& session) {
+		int16_t st = getNodeSession(node, session, 0);
+		if (st != RADIOLIB_ERR_NONE) {
+			state.lastLoraErr = st;
+			return false;
+		}
+		state.lastLoraErr = RADIOLIB_ERR_NONE;
+		return true;
+	}
 
-  int16_t sendUplink(const uint8_t* payload, size_t len, uint8_t fport) {
-    return node.sendReceive(payload, len, fport);
-  }
+	int16_t sendUplink(const uint8_t* payload, size_t len, uint8_t fport) {
+		return node.sendReceive(payload, len, fport);
+	}
 };
 
-
-static PowerManager powerManager;
-static DisplayManager displayManager;
-static GnssManager gnssManager;
 static LoRaWanManager lorawanManager;
 
 static void disableRadios() {
@@ -646,68 +700,67 @@ static bool isSessionInvalidError(int16_t err) {
 }
 
 static bool isUplinkOkError(int16_t err) {
-  if (err == RADIOLIB_ERR_NONE) return true;
+	if (err == RADIOLIB_ERR_NONE) return true;
 #ifdef RADIOLIB_ERR_RX_TIMEOUT
-  if (err == RADIOLIB_ERR_RX_TIMEOUT) return true;
+	if (err == RADIOLIB_ERR_RX_TIMEOUT) return true;
 #endif
 #ifdef RADIOLIB_ERR_TIMEOUT
-  if (err == RADIOLIB_ERR_TIMEOUT) return true;
+	if (err == RADIOLIB_ERR_TIMEOUT) return true;
 #endif
-  return false;
+	return false;
 }
 
 static size_t buildPayload(uint8_t* out, size_t maxLen, const GpsSnapshot& gpsSnap) {
-  // payload: 1 + 1 + 2 + 2 + 4 + 4 + 2 + 2 = 18 bytes
-  if (maxLen < 18) return 0;
+	// payload: 1 + 1 + 2 + 2 + 4 + 4 + 2 + 2 = 18 bytes
+	if (maxLen < 18) return 0;
 
-  uint8_t msgType = gpsSnap.fix ? 0x01 : 0x02;
+	uint8_t msgType = gpsSnap.fix ? 0x01 : 0x02;
 
-  // diagnose altijd
-  uint8_t sats = gpsSnap.sats;
-  uint16_t hdop = gpsSnap.hdop; // already in hundredths
-  uint16_t ageSec = (gpsSnap.ageMs >= 60000) ? 60 : (uint16_t)(gpsSnap.ageMs / 1000);
+	// diagnose altijd
+	uint8_t sats = gpsSnap.sats;
+	uint16_t hdop = gpsSnap.hdop; // already in hundredths
+	uint16_t ageSec = (gpsSnap.ageMs >= 60000) ? 60 : (uint16_t)(gpsSnap.ageMs / 1000);
 
-  int32_t latE5 = 0;
-  int32_t lonE5 = 0;
-  uint16_t spd10 = 0;
+	int32_t latE5 = 0;
+	int32_t lonE5 = 0;
+	uint16_t spd10 = 0;
 
-  if (gpsSnap.locationValid) {
-    // let op: dit is "heeft een lat/lon", niet per se jouw fix-policy
-    // Wil je ALTIJD lat/lon meesturen zodra TinyGPS het valid vindt? Zet dit aan:
-    // (dan verstuur je ook "rommelige" posities, maar je ziet wél data)
-    latE5 = (int32_t)llround(gpsSnap.lat * 1e5);
-    lonE5 = (int32_t)llround(gpsSnap.lon * 1e5);
-    spd10 = gps.speed.isValid() ? (uint16_t)lroundf(gpsSnap.speedKmph * 10.0f) : 0;
-  }
+	if (gpsSnap.locationValid) {
+		// let op: dit is "heeft een lat/lon", niet per se jouw fix-policy
+		// Wil je ALTIJD lat/lon meesturen zodra TinyGPS het valid vindt? Zet dit aan:
+		// (dan verstuur je ook "rommelige" posities, maar je ziet wél data)
+		latE5 = (int32_t)llround(gpsSnap.lat * 1e5);
+		lonE5 = (int32_t)llround(gpsSnap.lon * 1e5);
+		spd10 = gps.speed.isValid() ? (uint16_t)lroundf(gpsSnap.speedKmph * 10.0f) : 0;
+	}
 
-  uint16_t battMv = readBatteryMv();
+	uint16_t battMv = readBatteryMv();
 
-  out[0] = msgType;
-  out[1] = sats;
-  out[2] = (uint8_t)(hdop & 0xFF);
-  out[3] = (uint8_t)((hdop >> 8) & 0xFF);
-  out[4] = (uint8_t)(ageSec & 0xFF);
-  out[5] = (uint8_t)((ageSec >> 8) & 0xFF);
+	out[0] = msgType;
+	out[1] = sats;
+	out[2] = (uint8_t)(hdop & 0xFF);
+	out[3] = (uint8_t)((hdop >> 8) & 0xFF);
+	out[4] = (uint8_t)(ageSec & 0xFF);
+	out[5] = (uint8_t)((ageSec >> 8) & 0xFF);
 
-  out[6]  = (uint8_t)(latE5 & 0xFF);
-  out[7]  = (uint8_t)((latE5 >> 8) & 0xFF);
-  out[8]  = (uint8_t)((latE5 >> 16) & 0xFF);
-  out[9]  = (uint8_t)((latE5 >> 24) & 0xFF);
+	out[6] = (uint8_t)(latE5 & 0xFF);
+	out[7] = (uint8_t)((latE5 >> 8) & 0xFF);
+	out[8] = (uint8_t)((latE5 >> 16) & 0xFF);
+	out[9] = (uint8_t)((latE5 >> 24) & 0xFF);
 
-  out[10] = (uint8_t)(lonE5 & 0xFF);
-  out[11] = (uint8_t)((lonE5 >> 8) & 0xFF);
-  out[12] = (uint8_t)((lonE5 >> 16) & 0xFF);
-  out[13] = (uint8_t)((lonE5 >> 24) & 0xFF);
+	out[10] = (uint8_t)(lonE5 & 0xFF);
+	out[11] = (uint8_t)((lonE5 >> 8) & 0xFF);
+	out[12] = (uint8_t)((lonE5 >> 16) & 0xFF);
+	out[13] = (uint8_t)((lonE5 >> 24) & 0xFF);
 
-  out[14] = (uint8_t)(spd10 & 0xFF);
-  out[15] = (uint8_t)((spd10 >> 8) & 0xFF);
+	out[14] = (uint8_t)(spd10 & 0xFF);
+	out[15] = (uint8_t)((spd10 >> 8) & 0xFF);
 
-  out[16] = (uint8_t)(battMv & 0xFF);
-  out[17] = (uint8_t)((battMv >> 8) & 0xFF);
+	out[16] = (uint8_t)(battMv & 0xFF);
+	out[17] = (uint8_t)((battMv >> 8) & 0xFF);
 
-  return 18;
+	return 18;
 }
-
 
 // ---- Boot short-press gate ----
 struct BootGate {
@@ -971,107 +1024,55 @@ static void updateUplinkFlow() {
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println("Boot");
+	Serial.begin(115200);
+	delay(200);
+	Serial.println("Boot");
 
-  powerManager.begin();
-
-  // ---------- GNSS hard power-cycle + WAKE (stabiel) ----------
-  // 1) hard uit
-  axp.disableALDO4();
-  delay(1000);
-
-  // 2) hard aan
-  axp.setALDO4Voltage(3300);
-  axp.enableALDO4();
-  delay(1000);
-
-	// WAKE pin testen: eerst HIGH hold, daarna LOW hold (met pauze)
-	pinMode(GNSS_WAKE_PIN, OUTPUT);
-
-	Serial.println("WAKE test: HIGH hold 3s");
-	digitalWrite(GNSS_WAKE_PIN, HIGH);
-	delay(3000);
-
-	Serial.println("WAKE test: LOW hold 3s");
-	digitalWrite(GNSS_WAKE_PIN, LOW);
-	delay(3000);
-
-	// kies daarna de variant die UART leven geeft (laatste gekozen state blijft staan)
-	Serial.println("WAKE test done (leave LOW for now)");
-	digitalWrite(GNSS_WAKE_PIN, LOW);
-	delay(50);
-
-  // -----------------------------------------------------------
-
-  // jouw helper mag blijven (zet ALDO4 ook aan + WAKE LOW + prints)
-  powerManager.enableGnssRail();
-
-  // PPS: gebruik pullup voor stabiel signaal
-	pinMode(GNSS_PPS_PIN, INPUT);
-	attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), onPpsRise, RISING);
-  Serial.println("PPS interrupt attached");
-
-  displayManager.begin();
-
-  // GNSS UART pas starten na power-cycle + wake
-  gnssManager.begin();
-
-  disableRadios();
-
-  BootAction bootAction = detectBootAction();
-  if (bootAction == BootAction::ForceOTAA) {
-    lorawanManager.clearSession();
-    displayManager.showModeMessage("MODE: FORCE OTAA");
-    delay(1500);
-  }
-
-  bootGate.begin();
-  if (bootAction == BootAction::ForceOTAA) {
-    bootGate.forceOpen();
-    app.gate = GateState::Running;
-  }
-  resetJoinState();
-}
-
-
-
-void loop() {
-	gnssManager.update();
-	static uint32_t lastMs = 0;
-	static uint32_t lastPps = 0;
-	static uint32_t lastUart = 0;
-
-	uint32_t now = millis();
-	if (now - lastMs >= 1000) {
-		uint32_t p = ppsCount;           // volatile read
-		uint32_t ppsPerSec = p - lastPps;
-		lastPps = p;
-
-		uint32_t uartPerSec = gpsCharsPerSec; // jij berekent dit al elke sec
-		// let op: gpsCharsPerSec reset je al in GnssManager.update()
-
-		Serial.printf("GNSS pps/s=%lu uart/s=%lu | wake=%d\n",
-									(unsigned long)ppsPerSec,
-									(unsigned long)uartPerSec,
-									(int)digitalRead(GNSS_WAKE_PIN));
-
-		if (ppsPerSec > 0 && uartPerSec == 0) {
-			Serial.println("=> GNSS leeft (PPS), maar geen UART: baud/pins/protocol");
-		} else if (ppsPerSec == 0 && uartPerSec == 0) {
-			Serial.println("=> GNSS lijkt uit/sleep: power/wake/hardware");
-		} else if (uartPerSec > 0) {
-			Serial.println("=> UART data binnen (goed).");
-		}
-
-		lastMs = now;
+	if (!gnss_init()) {
+		Serial.println("GNSS init failed");
 	}
 
+	Serial.printf("PMU SYS=%.2f VBUS=%.2f BATT=%.2f VBUS_IN=%d BAT_CONN=%d\n",
+						 (double)axp.getSystemVoltage(), (double)axp.getVbusVoltage(),
+						 (double)axp.getBattVoltage(), axp.isVbusIn(),
+						 axp.isBatteryConnect());
+
+	// PPS: gebruik pullup voor stabiel signaal
+	pinMode(GNSS_PPS_PIN, INPUT);
+	attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), onPpsRise, RISING);
+
+	displayManager.begin();
+	disableRadios();
+
+	BootAction bootAction = detectBootAction();
+	if (bootAction == BootAction::ForceOTAA) {
+		lorawanManager.clearSession();
+		displayManager.showModeMessage("MODE: FORCE OTAA");
+		delay(1500);
+	}
+
+	bootGate.begin();
+	if (bootAction == BootAction::ForceOTAA) {
+		bootGate.forceOpen();
+		app.gate = GateState::Running;
+	}
+	resetJoinState();
+}
+
+void loop() {
+	gnss_poll();
+
+	uint32_t now = millis();
+	if (now - gnss.lastAnyByteMs > 5000) {
+		Serial.println("GNSS stalled -> reinit");
+		gpsBegin();
+		l76kInitAndEnableNmea();
+		gnss.lastAnyByteMs = millis();
+	}
 
 	bootGate.update();
 	updateChargeLed();
-	
+
 	if (bootGate.gateOpen && app.gate != GateState::Running) {
 		app.gate = GateState::Running;
 		resetJoinState();
@@ -1081,9 +1082,8 @@ void loop() {
 	updateUplinkFlow();
 
 	static uint32_t lastDrawMs = 0;
-	uint32_t now2 = millis();
-	if (now2 - lastDrawMs >= 250) {
-		lastDrawMs = now2;
+	if (now - lastDrawMs >= 250) {
+		lastDrawMs = now;
 		uint16_t battMv = readBatteryMv();
 		uint8_t battPct = readBatteryPercent();
 		GpsSnapshot snap = readGpsSnapshot();
