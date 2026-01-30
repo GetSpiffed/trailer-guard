@@ -28,6 +28,7 @@ static constexpr uint8_t DEV_SCL = 18;
 // HardwareSerial.begin(baud, config, RX, TX): RX must be GPIO8, TX must be GPIO9
 static constexpr uint8_t GNSS_RX_PIN = 8;	// ESP32 RX <- GNSS TX
 static constexpr uint8_t GNSS_TX_PIN = 9;	// ESP32 TX -> GNSS RX
+static constexpr uint8_t GNSS_WAKE_PIN = 7; // L76K wake-up
 static constexpr uint32_t GNSS_BAUD = 9600;
 
 // ---------------- BOOT button ----------------
@@ -53,7 +54,7 @@ static constexpr float		RADIO_TCXO_VOLTAGE = 1.6f;
 
 // ---------------- Globals ----------------
 XPowersAXP2101 axp;
-HardwareSerial GNSS(1);
+HardwareSerial GNSS(2);
 TinyGPSPlus gps;
 
 // GPS stats (voor OLED diagnose)
@@ -186,11 +187,15 @@ struct PowerManager {
 	}
 
 	void enableGnssRail() {
-		// ALDO4 powers the GPS; enable before GNSS.begin() and wait briefly.
 		axp.setALDO4Voltage(3300);
 		axp.enableALDO4();
-		delay(150);
+
+		pinMode(GNSS_WAKE_PIN, OUTPUT);
+		digitalWrite(GNSS_WAKE_PIN, HIGH);   // GNSS wakker houden
+
+		delay(500);
 	}
+
 };
 
 // ---- DisplayManager (OLED) ----
