@@ -31,6 +31,12 @@ static constexpr uint8_t GNSS_TX_PIN = 9;	// ESP32 TX -> GNSS RX
 static constexpr uint8_t GNSS_WAKE_PIN = 7; // L76K wake-up
 static constexpr uint32_t GNSS_BAUD = 9600;
 
+static constexpr uint8_t GNSS_PPS_PIN = 6; // per LilyGO wiki
+static volatile uint32_t ppsCount = 0;
+
+static void IRAM_ATTR onPpsRise() { ppsCount++; }
+
+
 // ---------------- BOOT button ----------------
 static constexpr uint8_t BOOT_PIN = 0; // Button1 (BOOT)
 static constexpr uint32_t FORCE_OTAA_MIN_MS = 2000;
@@ -198,10 +204,18 @@ struct PowerManager {
 		axp.enableALDO4();
 
 		pinMode(GNSS_WAKE_PIN, OUTPUT);
-		digitalWrite(GNSS_WAKE_PIN, HIGH);   // GNSS wakker houden
+		digitalWrite(GNSS_WAKE_PIN, LOW);      // <— fix: LOW vasthouden
+		delay(50);
+
+		Serial.printf("WAKE raw=%d (expected 0)\n", digitalRead(GNSS_WAKE_PIN));
+		Serial.printf("AXP: VBUS=%d BattConn=%d BattV=%.2f\n",
+									axp.isVbusIn(),
+									axp.isBatteryConnect(),
+									axp.getBattVoltage());
 
 		delay(500);
 	}
+
 
 };
 
@@ -267,12 +281,10 @@ struct DisplayManager {
 		u8g2.drawStr(0, 12, line);
 
 		if (state.gate != GateState::Running) {
-			u8g2.drawStr(0, 30, "Press BOOT");
-			u8g2.drawStr(0, 42, "short press");
-			u8g2.drawStr(0, 60, "to start");
-			u8g2.sendBuffer();
-			return;
+			u8g2.drawStr(0, 30, "LORA: press BOOT");
+			// gewoon doorrenderen, geen return
 		}
+
 
 		uint32_t now = millis();
 		int32_t countdown = 0;
@@ -305,16 +317,23 @@ struct DisplayManager {
 							 (unsigned)attempt,
 							 (unsigned)maxAttempt);
 		}
-		u8g2.drawStr(0, 30, line);
 
-		// 3) LoRa error line
-		bool uplinkOk = (state.uplinkResult == UplinkResult::Ok);
-		snprintf(line, sizeof(line), "LORA %d %s",
-						 (int)state.lastLoraErr,
-						 loraErrLabel(state.lastLoraErr, uplinkOk));
-		u8g2.drawStr(0, 42, line);
+		if (state.gate == GateState::Running) {
+			u8g2.drawStr(0, 30, line);
+		}
 
-		// 4) GPS diagnostics
+		if (state.gate != GateState::Running) {
+			u8g2.drawStr(0, 42, "LORA: idle");
+		} else {
+			bool uplinkOk = (state.uplinkResult == UplinkResult::Ok);
+			snprintf(line, sizeof(line), "LORA %d %s",
+							(int)state.lastLoraErr,
+							loraErrLabel(state.lastLoraErr, uplinkOk));
+			u8g2.drawStr(0, 42, line);
+		}
+
+
+		// 3) GPS diagnostics
 		if (gpsSnap.charsPerSec == 0) {
 			snprintf(line, sizeof(line), "GPS NO UART");
 		} else {
@@ -341,26 +360,39 @@ struct DisplayManager {
 };
 
 // ---- GNSS Manager ----
+// ---- GNSS Manager ----
 struct GnssManager {
-	void begin() {
-		GNSS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
-	}
+  void begin() {
+    GNSS.setRxBufferSize(2048);          // helpt tegen overflow
+    GNSS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
+    while (GNSS.available()) GNSS.read(); // flush rommel
+  }
 
-	void update() {
-		while (GNSS.available()) {
-			char c = (char)GNSS.read();
-			gpsChars++;
-			gps.encode(c);
-		}
+  void update() {
+    while (GNSS.available()) {
+      char c = (char)GNSS.read();
+      gpsChars++;
 
-		uint32_t now = millis();
-		if (now - gpsLastStatsMs >= 1000) {
-			gpsCharsPerSec = (uint16_t)gpsChars;
-			gpsChars = 0;
-			gpsLastStatsMs = now;
-		}
-	}
+      // NMEA start-char detectie (veelzeggender dan random 1 byte)
+      if (c == '$') {
+        Serial.println("GNSS: saw '$' (NMEA start)");
+      }
+
+      // zet raw dump UIT (kan timing slopen)
+      // Serial.write(c);
+
+      gps.encode(c);
+    }
+
+    uint32_t now = millis();
+    if (now - gpsLastStatsMs >= 1000) {
+      gpsCharsPerSec = (uint16_t)gpsChars;
+      gpsChars = 0;
+      gpsLastStatsMs = now;
+    }
+  }
 };
+
 
 // ---- LoRaWAN session storage ----
 static constexpr uint32_t SESSION_MAGIC = 0x4C57534Eu; // "LWSN"
@@ -894,29 +926,104 @@ static void updateUplinkFlow() {
 }
 
 void setup() {
-	powerManager.begin();
-	powerManager.enableGnssRail();
-	displayManager.begin();
-	gnssManager.begin();
-	disableRadios();
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("Boot");
 
-	BootAction bootAction = detectBootAction();
-	if (bootAction == BootAction::ForceOTAA) {
-		lorawanManager.clearSession();
-		displayManager.showModeMessage("MODE: FORCE OTAA");
-		delay(1500);
-	}
+  powerManager.begin();
 
-	bootGate.begin();
-	if (bootAction == BootAction::ForceOTAA) {
-		bootGate.forceOpen();
-		app.gate = GateState::Running;
-	}
-	resetJoinState();
+  // ---------- GNSS hard power-cycle + WAKE (stabiel) ----------
+  // 1) hard uit
+  axp.disableALDO4();
+  delay(1000);
+
+  // 2) hard aan
+  axp.setALDO4Voltage(3300);
+  axp.enableALDO4();
+  delay(1000);
+
+	// WAKE pin testen: eerst HIGH hold, daarna LOW hold (met pauze)
+	pinMode(GNSS_WAKE_PIN, OUTPUT);
+
+	Serial.println("WAKE test: HIGH hold 3s");
+	digitalWrite(GNSS_WAKE_PIN, HIGH);
+	delay(3000);
+
+	Serial.println("WAKE test: LOW hold 3s");
+	digitalWrite(GNSS_WAKE_PIN, LOW);
+	delay(3000);
+
+	// kies daarna de variant die UART leven geeft (laatste gekozen state blijft staan)
+	Serial.println("WAKE test done (leave LOW for now)");
+	digitalWrite(GNSS_WAKE_PIN, LOW);
+	delay(50);
+
+  // -----------------------------------------------------------
+
+  // jouw helper mag blijven (zet ALDO4 ook aan + WAKE LOW + prints)
+  powerManager.enableGnssRail();
+
+  // PPS: gebruik pullup voor stabiel signaal
+	pinMode(GNSS_PPS_PIN, INPUT);
+	attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), onPpsRise, RISING);
+  Serial.println("PPS interrupt attached");
+
+  displayManager.begin();
+
+  // GNSS UART pas starten na power-cycle + wake
+  gnssManager.begin();
+
+  disableRadios();
+
+  BootAction bootAction = detectBootAction();
+  if (bootAction == BootAction::ForceOTAA) {
+    lorawanManager.clearSession();
+    displayManager.showModeMessage("MODE: FORCE OTAA");
+    delay(1500);
+  }
+
+  bootGate.begin();
+  if (bootAction == BootAction::ForceOTAA) {
+    bootGate.forceOpen();
+    app.gate = GateState::Running;
+  }
+  resetJoinState();
 }
+
+
 
 void loop() {
 	gnssManager.update();
+	static uint32_t lastMs = 0;
+	static uint32_t lastPps = 0;
+	static uint32_t lastUart = 0;
+
+	uint32_t now = millis();
+	if (now - lastMs >= 1000) {
+		uint32_t p = ppsCount;           // volatile read
+		uint32_t ppsPerSec = p - lastPps;
+		lastPps = p;
+
+		uint32_t uartPerSec = gpsCharsPerSec; // jij berekent dit al elke sec
+		// let op: gpsCharsPerSec reset je al in GnssManager.update()
+
+		Serial.printf("GNSS pps/s=%lu uart/s=%lu | wake=%d\n",
+									(unsigned long)ppsPerSec,
+									(unsigned long)uartPerSec,
+									(int)digitalRead(GNSS_WAKE_PIN));
+
+		if (ppsPerSec > 0 && uartPerSec == 0) {
+			Serial.println("=> GNSS leeft (PPS), maar geen UART: baud/pins/protocol");
+		} else if (ppsPerSec == 0 && uartPerSec == 0) {
+			Serial.println("=> GNSS lijkt uit/sleep: power/wake/hardware");
+		} else if (uartPerSec > 0) {
+			Serial.println("=> UART data binnen (goed).");
+		}
+
+		lastMs = now;
+	}
+
+
 	bootGate.update();
 	updateChargeLed();
 	
@@ -929,9 +1036,9 @@ void loop() {
 	updateUplinkFlow();
 
 	static uint32_t lastDrawMs = 0;
-	uint32_t now = millis();
-	if (now - lastDrawMs >= 250) {
-		lastDrawMs = now;
+	uint32_t now2 = millis();
+	if (now2 - lastDrawMs >= 250) {
+		lastDrawMs = now2;
 		uint16_t battMv = readBatteryMv();
 		uint8_t battPct = readBatteryPercent();
 		GpsSnapshot snap = readGpsSnapshot();
