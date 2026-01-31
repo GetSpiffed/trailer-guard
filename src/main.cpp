@@ -1,4 +1,4 @@
-// Core app: LoRaWAN + power + OLED
+// Core app: LoRaWAN + power + OLED + GPS
 #include <Arduino.h>
 #include <Wire.h>
 #include <XPowersLib.h>
@@ -8,25 +8,26 @@
 
 #include <SPI.h>
 #include <RadioLib.h>
-#include "Preferences.h"
+#include <Preferences.h>
+#include <TinyGPSPlus.h>
 
 #include "secrets.h"
 
-// ---------------- PMU bus ----------------
-TwoWire Wire1_PMU(0);
+// ---------------- Pinmap ----------------
+// PMU bus
 static constexpr uint8_t PMU_SDA = 42;
 static constexpr uint8_t PMU_SCL = 41;
 
-// ---------------- OLED + sensors bus ----------------
+// OLED + sensors bus
 static constexpr uint8_t DEV_SDA = 17;
 static constexpr uint8_t DEV_SCL = 18;
 
-// ---------------- BOOT button ----------------
+// BOOT button
 static constexpr uint8_t BOOT_PIN = 0; // Button1 (BOOT)
 static constexpr uint32_t FORCE_OTAA_MIN_MS = 2000;
 static constexpr uint32_t FORCE_OTAA_MAX_MS = 6000;
 
-// ---------------- T-Beam S3 Supreme SX1262 pinmap ----------------
+// T-Beam S3 Supreme SX1262 pinmap
 static constexpr int LORA_SCK = 12;
 static constexpr int LORA_MISO = 13;
 static constexpr int LORA_MOSI = 11;
@@ -34,6 +35,13 @@ static constexpr int LORA_CS = 10;
 static constexpr int LORA_RST = 5;
 static constexpr int LORA_DIO1 = 1;
 static constexpr int LORA_BUSY = 4;
+
+// GPS (L76K)
+static constexpr uint8_t GPS_RX_PIN = 9;   // ESP RX <- GNSS TX
+static constexpr uint8_t GPS_TX_PIN = 8;   // ESP TX -> GNSS RX
+static constexpr uint8_t GPS_EN_PIN = 7;   // GPS_EN
+static constexpr uint8_t GPS_PPS_PIN = 6;  // PPS (optional)
+static constexpr uint32_t GPS_BAUD = 9600;
 
 // ---------------- App settings (tunable) ----------------
 static constexpr uint8_t LORAWAN_FPORT = 1;
@@ -44,11 +52,21 @@ static constexpr uint8_t JOIN_MAX_ATTEMPTS = 8;
 static constexpr uint8_t RADIO_INIT_MAX_ATTEMPTS = 5;
 static constexpr float RADIO_TCXO_VOLTAGE = 1.6f;
 
+// Tracker placeholders
+static constexpr float MOVE_SPEED_MPS = 1.5f;
+static constexpr float MOVE_DISTANCE_M = 30.0f;
+static constexpr uint32_t KEEPALIVE_INTERVAL_MS = 86400000;
+
 // ---------------- Globals ----------------
+TwoWire Wire1_PMU(0);
 XPowersAXP2101 axp;
 
 // OLED: SH1106 128x64, SW I2C met expliciete pins
 U8G2_SH1106_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, DEV_SCL, DEV_SDA, U8X8_PIN_NONE);
+
+// GPS
+HardwareSerial SerialGPS(2);
+TinyGPSPlus gps;
 
 // ---------------- LoRaWAN (RadioLib) ----------------
 SX1262 radio(new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY));
@@ -58,6 +76,9 @@ using LoRaWANSession = LoRaWANSchemeSession_t;
 #ifndef RADIOLIB_ERR_UNSUPPORTED
 #define RADIOLIB_ERR_UNSUPPORTED RADIOLIB_ERR_UNKNOWN
 #endif
+
+// ---------------- Debug ----------------
+#define GPS_DEBUG 0
 
 enum class GateState : uint8_t {
 	WaitingForBoot,
@@ -102,6 +123,27 @@ struct AppState {
 
 static AppState app;
 
+struct CurrentFix {
+	bool hasFix = false;
+	bool hasSpeed = false;
+	bool hasCourse = false;
+	float lat = 0.0f;
+	float lon = 0.0f;
+	float speedMps = 0.0f;
+	float courseDeg = 0.0f;
+	int32_t sats = -1;
+	float hdop = -1.0f;
+	uint32_t lastFixMs = 0;
+	uint32_t lastGpsByteMs = 0;
+	char lastNmeaLine[220] = {0};
+	bool hadNmeaLine = false;
+	float anchorLat = 0.0f;
+	float anchorLon = 0.0f;
+	bool anchorValid = false;
+};
+
+static CurrentFix currentFix;
+
 // ---------- PMU helpers ----------
 static uint16_t readBatteryMv() {
 	if (!axp.isBatteryConnect()) return 0;
@@ -124,7 +166,6 @@ static uint8_t readBatteryPercent() {
 
 static void updateChargeLed() {
 	// LED aan als er USB/VBUS binnenkomt, anders uit.
-	// (simpel en stabiel voor debug)
 	bool vbus = axp.isVbusIn();
 	axp.setChargingLedMode(vbus ? XPOWERS_CHG_LED_ON : XPOWERS_CHG_LED_OFF);
 }
@@ -142,6 +183,9 @@ struct PowerManager {
 		axp.enableBattDetection();
 		axp.enableTemperatureMeasure();
 
+		axp.setPowerChannelVoltage(XPOWERS_ALDO4, 3300);
+		axp.enablePowerOutput(XPOWERS_ALDO4);
+
 		axp.setALDO1Voltage(3300);
 		axp.enableALDO1();
 
@@ -151,6 +195,132 @@ struct PowerManager {
 		return true;
 	}
 };
+
+// ---- GPS init ----
+static void drainGpsUart(uint32_t ms = 150) {
+	uint32_t t0 = millis();
+	while (millis() - t0 < ms) {
+		while (SerialGPS.available()) (void)SerialGPS.read();
+		delay(1);
+	}
+}
+
+static void gpsEnableHigh() {
+	pinMode(GPS_EN_PIN, OUTPUT);
+	digitalWrite(GPS_EN_PIN, HIGH);
+	delay(350);
+}
+
+static void gpsBegin() {
+	SerialGPS.end();
+	delay(30);
+	SerialGPS.setRxBufferSize(4096);
+	SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+	delay(80);
+	drainGpsUart(200);
+}
+
+static void gpsStopNmea() {
+	SerialGPS.write("$PCAS03,0,0,0,0,0,0,0,0,0,0,,,0,0*02\r\n");
+	delay(60);
+	drainGpsUart(120);
+}
+
+static void gpsInitSequence() {
+	gpsStopNmea();
+	SerialGPS.write("$PCAS06,0*1B\r\n");
+	delay(80);
+	SerialGPS.write("$PCAS04,5*1C\r\n");
+	delay(120);
+	SerialGPS.write("$PCAS11,3*1E\r\n");
+	delay(120);
+	SerialGPS.write("$PCAS03,1,0,0,0,1,0,0,0,0,0,,,0,0*02\r\n");
+	delay(120);
+}
+
+static void gpsStart() {
+	pinMode(GPS_PPS_PIN, INPUT);
+	gpsEnableHigh();
+	gpsBegin();
+	gpsInitSequence();
+}
+
+// ---- GPS pump + parse ----
+static void updateGpsFix() {
+	currentFix.hasFix = gps.location.isValid();
+	currentFix.lat = currentFix.hasFix ? gps.location.lat() : currentFix.lat;
+	currentFix.lon = currentFix.hasFix ? gps.location.lng() : currentFix.lon;
+	currentFix.sats = gps.satellites.isValid() ? gps.satellites.value() : -1;
+	currentFix.hdop = gps.hdop.isValid() ? gps.hdop.hdop() : -1.0f;
+	currentFix.hasSpeed = gps.speed.isValid();
+	currentFix.speedMps = currentFix.hasSpeed ? gps.speed.mps() : 0.0f;
+	currentFix.hasCourse = gps.course.isValid();
+	currentFix.courseDeg = currentFix.hasCourse ? gps.course.deg() : 0.0f;
+	if (currentFix.hasFix && gps.location.isUpdated()) {
+		currentFix.lastFixMs = millis();
+		if (!currentFix.anchorValid) {
+			currentFix.anchorLat = currentFix.lat;
+			currentFix.anchorLon = currentFix.lon;
+			currentFix.anchorValid = true;
+		}
+	}
+}
+
+static void pumpGpsUartAndParse() {
+	static char line[220];
+	static uint16_t idx = 0;
+
+	while (SerialGPS.available()) {
+		char c = (char)SerialGPS.read();
+		gps.encode(c);
+		currentFix.lastGpsByteMs = millis();
+
+		if (c == '\n') {
+			line[idx] = 0;
+			if (idx > 6) {
+				strncpy(currentFix.lastNmeaLine, line, sizeof(currentFix.lastNmeaLine) - 1);
+				currentFix.lastNmeaLine[sizeof(currentFix.lastNmeaLine) - 1] = 0;
+				currentFix.hadNmeaLine = true;
+			}
+			idx = 0;
+		} else if (c != '\r') {
+			if (idx < sizeof(line) - 1) line[idx++] = c;
+		}
+	}
+
+	updateGpsFix();
+
+	uint32_t now = millis();
+	if (currentFix.lastGpsByteMs != 0 && (now - currentFix.lastGpsByteMs) > 5000) {
+#if GPS_DEBUG
+		Serial.println("GPS: 5s stil, re-init");
+#endif
+		gpsBegin();
+		gpsInitSequence();
+		currentFix.lastGpsByteMs = now;
+	}
+}
+
+// ---- OLED 1-line GPS renderer ----
+static void renderGpsLine(char* out, size_t outLen) {
+	int sats = currentFix.sats;
+	float hdop = currentFix.hdop;
+	uint32_t now = millis();
+	bool noNmea = currentFix.lastGpsByteMs == 0 || (now - currentFix.lastGpsByteMs) > 5000;
+
+	if (currentFix.hasFix) {
+		snprintf(out, outLen, "FIX lat=%.6f lon=%.6f sats=%d hdop=%.1f",
+				 (double)currentFix.lat, (double)currentFix.lon, sats, (double)hdop);
+		return;
+	}
+
+	if (noNmea) {
+		snprintf(out, outLen, "NO FIX sats=%d hdop=%.1f NO NMEA", sats, (double)hdop);
+		return;
+	}
+
+	snprintf(out, outLen, "NO FIX sats=%d hdop=%.1f", sats, (double)hdop);
+}
 
 // ---- DisplayManager (OLED) ----
 struct DisplayManager {
@@ -209,7 +379,7 @@ struct DisplayManager {
 		}
 	}
 
-	void render(const AppState& state, uint16_t battMv, uint8_t battPct) {
+	void render(const AppState& state, uint16_t battMv, uint8_t battPct, const char* gpsLine) {
 		u8g2.clearBuffer();
 		u8g2.setFont(u8g2_font_6x10_tf);
 
@@ -219,7 +389,7 @@ struct DisplayManager {
 		float battV = readBatteryVoltageV();
 		if (battV > 0.0f) {
 			snprintf(line, sizeof(line), "BAT %.2fV %u%%", (double)battV,
-						 (unsigned)battPct);
+					 (unsigned)battPct);
 		} else {
 			snprintf(line, sizeof(line), "BAT --.-V %u%%", (unsigned)battPct);
 		}
@@ -239,18 +409,18 @@ struct DisplayManager {
 		// 2) Join state + countdown
 		if (countdown > 0) {
 			uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts
-																											 : state.joinAttempts;
+															 : state.joinAttempts;
 			uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS
-																											 : JOIN_MAX_ATTEMPTS;
+															 : JOIN_MAX_ATTEMPTS;
 			snprintf(line, sizeof(line), "JOIN %s %u/%u T-%lds", joinStateText(state.joinState),
-						 (unsigned)attempt, (unsigned)maxAttempt, (long)countdown);
+					 (unsigned)attempt, (unsigned)maxAttempt, (long)countdown);
 		} else {
 			uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts
-																											 : state.joinAttempts;
+															 : state.joinAttempts;
 			uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS
-																											 : JOIN_MAX_ATTEMPTS;
+															 : JOIN_MAX_ATTEMPTS;
 			snprintf(line, sizeof(line), "JOIN %s %u/%u", joinStateText(state.joinState),
-						 (unsigned)attempt, (unsigned)maxAttempt);
+					 (unsigned)attempt, (unsigned)maxAttempt);
 		}
 
 		if (state.gate == GateState::Running) {
@@ -262,8 +432,12 @@ struct DisplayManager {
 		} else {
 			bool uplinkOk = (state.uplinkResult == UplinkResult::Ok);
 			snprintf(line, sizeof(line), "LORA %d %s", (int)state.lastLoraErr,
-						 loraErrLabel(state.lastLoraErr, uplinkOk));
+					 loraErrLabel(state.lastLoraErr, uplinkOk));
 			u8g2.drawStr(0, 42, line);
+		}
+
+		if (gpsLine) {
+			u8g2.drawStr(0, 54, gpsLine);
 		}
 
 		u8g2.sendBuffer();
@@ -474,16 +648,6 @@ static void disableRadios() {
 	btStop();
 }
 
-static bool isTimeoutErr(int16_t err) {
-#ifdef RADIOLIB_ERR_RX_TIMEOUT
-	if (err == RADIOLIB_ERR_RX_TIMEOUT) return true;
-#endif
-#ifdef RADIOLIB_ERR_TIMEOUT
-	if (err == RADIOLIB_ERR_TIMEOUT) return true;
-#endif
-	return false;
-}
-
 static bool isSessionInvalidError(int16_t err) {
 	switch (err) {
 #ifdef RADIOLIB_ERR_MIC_MISMATCH
@@ -512,18 +676,92 @@ static bool isUplinkOkError(int16_t err) {
 	return false;
 }
 
-static size_t buildPayload(uint8_t* out, size_t maxLen) {
-	// payload: 1 + 2 = 3 bytes (msg type + battery mv)
+static bool isMoving(const CurrentFix& fix) {
+	if (!fix.hasFix) return false;
+	if (fix.hasSpeed && fix.speedMps > MOVE_SPEED_MPS) return true;
+	if (fix.anchorValid) {
+		double distance = TinyGPSPlus::distanceBetween(
+			fix.anchorLat,
+			fix.anchorLon,
+			fix.lat,
+			fix.lon);
+		if (distance > MOVE_DISTANCE_M) return true;
+	}
+	return false;
+}
+
+static uint32_t nextUplinkIntervalMs(const CurrentFix& fix) {
+	return isMoving(fix) ? UPLINK_INTERVAL_MS : KEEPALIVE_INTERVAL_MS;
+}
+
+static size_t buildPayload(uint8_t* out, size_t maxLen, const CurrentFix& fix) {
+	// Compact payload mapping (little endian):
+	// Byte0: flags (bit0=fix, bit1=moving, bit2=speed/course)
+	// Byte1-2: battery mV (uint16)
+	// FIX:
+	// Byte3-6: lat * 1e6 (int32)
+	// Byte7-10: lon * 1e6 (int32)
+	// Byte11: sats (uint8)
+	// Byte12-13: hdop * 10 (uint16)
+	// Byte14-15: speed * 10 (uint16, m/s) [optional]
+	// Byte16-17: course * 10 (uint16, deg) [optional]
+	// NO FIX:
+	// Byte3: sats (uint8)
+	// Byte4-5: hdop * 10 (uint16)
+	// Byte6-7: last fix age (uint16, seconds, 0xFFFF unknown)
 	if (maxLen < 3) return 0;
 
-	uint8_t msgType = 0x00;
-	uint16_t battMv = readBatteryMv();
+	uint8_t flags = 0;
+	if (fix.hasFix) flags |= 0x01;
+	if (isMoving(fix)) flags |= 0x02;
+	if (fix.hasSpeed && fix.hasCourse) flags |= 0x04;
 
-	out[0] = msgType;
+	uint16_t battMv = readBatteryMv();
+	out[0] = flags;
 	out[1] = (uint8_t)(battMv & 0xFF);
 	out[2] = (uint8_t)((battMv >> 8) & 0xFF);
 
-	return 3;
+	if (fix.hasFix) {
+		if (maxLen < 14) return 3;
+		int32_t lat = (int32_t)lroundf(fix.lat * 1000000.0f);
+		int32_t lon = (int32_t)lroundf(fix.lon * 1000000.0f);
+		uint8_t sats = (fix.sats >= 0 && fix.sats <= 255) ? (uint8_t)fix.sats : 0;
+		uint16_t hdop10 = (fix.hdop >= 0.0f) ? (uint16_t)lroundf(fix.hdop * 10.0f) : 0;
+
+		memcpy(out + 3, &lat, sizeof(lat));
+		memcpy(out + 7, &lon, sizeof(lon));
+		out[11] = sats;
+		out[12] = (uint8_t)(hdop10 & 0xFF);
+		out[13] = (uint8_t)((hdop10 >> 8) & 0xFF);
+
+		size_t len = 14;
+		if (flags & 0x04) {
+			if (maxLen < 18) return len;
+			uint16_t speed10 = (uint16_t)lroundf(fix.speedMps * 10.0f);
+			uint16_t course10 = (uint16_t)lroundf(fix.courseDeg * 10.0f);
+			out[14] = (uint8_t)(speed10 & 0xFF);
+			out[15] = (uint8_t)((speed10 >> 8) & 0xFF);
+			out[16] = (uint8_t)(course10 & 0xFF);
+			out[17] = (uint8_t)((course10 >> 8) & 0xFF);
+			len = 18;
+		}
+		return len;
+	}
+
+	if (maxLen < 8) return 3;
+	uint8_t sats = (fix.sats >= 0 && fix.sats <= 255) ? (uint8_t)fix.sats : 0;
+	uint16_t hdop10 = (fix.hdop >= 0.0f) ? (uint16_t)lroundf(fix.hdop * 10.0f) : 0;
+	uint16_t ageSec = 0xFFFF;
+	if (fix.lastFixMs > 0) {
+		uint32_t ageMs = millis() - fix.lastFixMs;
+		ageSec = (ageMs > 0xFFFFu * 1000u) ? 0xFFFF : (uint16_t)(ageMs / 1000u);
+	}
+	out[3] = sats;
+	out[4] = (uint8_t)(hdop10 & 0xFF);
+	out[5] = (uint8_t)((hdop10 >> 8) & 0xFF);
+	out[6] = (uint8_t)(ageSec & 0xFF);
+	out[7] = (uint8_t)((ageSec >> 8) & 0xFF);
+	return 8;
 }
 
 // ---- Boot short-press gate ----
@@ -604,7 +842,7 @@ struct BootGate {
 					state = State::Pressing;
 					pressStartMs = now;
 				} else if (now - releaseStartMs >= DEBOUNCE_MS &&
-									 now - rawChangeMs >= DEBOUNCE_MS) {
+							 now - rawChangeMs >= DEBOUNCE_MS) {
 					gateOpen = true;
 					state = State::Open;
 				}
@@ -693,8 +931,8 @@ static void updateJoinFlow() {
 		case JoinState::TestUplink: {
 			if (now < app.nextActionMs) return;
 
-			uint8_t payload[3];
-			size_t n = buildPayload(payload, sizeof(payload));
+			uint8_t payload[24];
+			size_t n = buildPayload(payload, sizeof(payload), currentFix);
 
 			int16_t st = lorawanManager.sendUplink(payload, n, LORAWAN_FPORT);
 			app.lastLoraErr = st;
@@ -710,7 +948,10 @@ static void updateJoinFlow() {
 					lorawanManager.saveSession(saved);
 				}
 
-				app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
+				app.nextUplinkMs = now + nextUplinkIntervalMs(currentFix);
+				currentFix.anchorLat = currentFix.lat;
+				currentFix.anchorLon = currentFix.lon;
+				currentFix.anchorValid = currentFix.hasFix;
 			} else if (isSessionInvalidError(st)) {
 				// echte sessie-fout: session wissen en opnieuw joinen
 				lorawanManager.clearSession();
@@ -741,7 +982,10 @@ static void updateJoinFlow() {
 				app.joined = true;
 				app.joinState = JoinState::Ok;
 				app.testUplinkBackoff = 0;
-				app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
+				app.nextUplinkMs = now + nextUplinkIntervalMs(currentFix);
+				currentFix.anchorLat = currentFix.lat;
+				currentFix.anchorLon = currentFix.lon;
+				currentFix.anchorValid = currentFix.hasFix;
 			} else {
 				app.joinState = JoinState::Join;
 				app.nextActionMs = now + JOIN_RETRY_MS;
@@ -761,8 +1005,8 @@ static void updateUplinkFlow() {
 	uint32_t now = millis();
 	if (app.nextUplinkMs == 0 || now < app.nextUplinkMs) return;
 
-	uint8_t payload[3];
-	size_t n = buildPayload(payload, sizeof(payload));
+	uint8_t payload[24];
+	size_t n = buildPayload(payload, sizeof(payload), currentFix);
 
 	int16_t st = lorawanManager.sendUplink(payload, n, LORAWAN_FPORT);
 	app.lastLoraErr = st;
@@ -774,6 +1018,9 @@ static void updateUplinkFlow() {
 		if (lorawanManager.fetchSession(app, session)) {
 			lorawanManager.saveSession(session);
 		}
+		currentFix.anchorLat = currentFix.lat;
+		currentFix.anchorLon = currentFix.lon;
+		currentFix.anchorValid = currentFix.hasFix;
 	} else if (isSessionInvalidError(st)) {
 		lorawanManager.clearSession();
 		app.joined = false;
@@ -782,7 +1029,7 @@ static void updateUplinkFlow() {
 		app.nextActionMs = now + JOIN_RETRY_MS;
 	}
 
-	app.nextUplinkMs = now + UPLINK_INTERVAL_MS;
+	app.nextUplinkMs = now + nextUplinkIntervalMs(currentFix);
 }
 
 void setup() {
@@ -795,9 +1042,11 @@ void setup() {
 	}
 
 	Serial.printf("PMU SYS=%.2f VBUS=%.2f BATT=%.2f VBUS_IN=%d BAT_CONN=%d\n",
-						 (double)axp.getSystemVoltage(), (double)axp.getVbusVoltage(),
-						 (double)axp.getBattVoltage(), axp.isVbusIn(),
-						 axp.isBatteryConnect());
+				 (double)axp.getSystemVoltage(), (double)axp.getVbusVoltage(),
+				 (double)axp.getBattVoltage(), axp.isVbusIn(),
+				 axp.isBatteryConnect());
+
+	gpsStart();
 
 	displayManager.begin();
 	disableRadios();
@@ -820,6 +1069,7 @@ void setup() {
 void loop() {
 	uint32_t now = millis();
 
+	pumpGpsUartAndParse();
 	bootGate.update();
 	updateChargeLed();
 
@@ -836,6 +1086,8 @@ void loop() {
 		lastDrawMs = now;
 		uint16_t battMv = readBatteryMv();
 		uint8_t battPct = readBatteryPercent();
-		displayManager.render(app, battMv, battPct);
+		char gpsLine[64];
+		renderGpsLine(gpsLine, sizeof(gpsLine));
+		displayManager.render(app, battMv, battPct, gpsLine);
 	}
 }
