@@ -115,6 +115,8 @@ struct AppState {
 	bool sessionRestored = false;
 	uint8_t testUplinkBackoff = 0;
 	bool forceOtaaThisBoot = false;
+	bool inputReady = false;	 // bootButton is actief (events worden gedetecteerd)
+	bool initDone	 = false;	 // alle init klaar, nu pas READY tonen
 };
 
 static AppState app;
@@ -422,21 +424,30 @@ struct DisplayManager {
 		u8g2.clearBuffer();
 		u8g2.setFont(u8g2_font_6x10_tf);
 
-		const char* statusLine = "FORCE OTAA: HOLD";
-		if (heldMs >= FORCE_OTAA_MIN_MS && heldMs <= FORCE_OTAA_MAX_MS) {
+		const char* statusLine = nullptr;
+
+		// 0..2s: join hint
+		if (heldMs < FORCE_OTAA_MIN_MS) {
+			statusLine = "RELEASE: JOIN (short)";
+		} 
+		// 2..6s: otaa ready
+		else if (heldMs <= FORCE_OTAA_MAX_MS) {
 			statusLine = "FORCE OTAA: READY";
-		} else if (heldMs > FORCE_OTAA_MAX_MS) {
+		} 
+		// >6s: too long
+		else {
 			statusLine = "FORCE OTAA: TOO LONG";
 		}
 
-		acceptScrollText(holdScroll, statusLine, u8g2, " - ", 200);
+		acceptScrollText(holdScroll, statusLine, u8g2, " - ", 120);
 		drawMarqueeLoop(u8g2, 12, holdScroll, " - ", 2, 40);
 
+		// tijdregel
 		char line1[32];
-		snprintf(line1, sizeof(line1), "HOLD %lus", (unsigned long)(heldMs / 1000));
+		snprintf(line1, sizeof(line1), "HOLD %lums", (unsigned long)heldMs);
 		u8g2.drawStr(0, 34, line1);
 
-		// mini “progress” balkje 0..6s
+		// progress 0..6s
 		const uint16_t cap = FORCE_OTAA_MAX_MS;
 		uint16_t w = (heldMs >= cap) ? 128 : (uint16_t)((heldMs * 128UL) / cap);
 		u8g2.drawFrame(0, 52, 128, 10);
@@ -444,6 +455,7 @@ struct DisplayManager {
 
 		u8g2.sendBuffer();
 	}
+
 
 
 	static void drawMarqueeLoop(U8G2& u8g2, int y, ScrollText& st,
@@ -510,49 +522,57 @@ struct DisplayManager {
 		}
 		u8g2.drawStr(0, 12, line);
 
+		// gate closed -> instructie + READY zodra initDone
 		if (state.gate != GateState::Running) {
 			u8g2.drawStr(0, 30, "LORA: press BOOT");
-		}
 
-		uint32_t now = millis();
-		int32_t countdown = 0;
-		if (state.nextActionMs > now) {
-			countdown = (int32_t)((state.nextActionMs - now) / 1000);
-		}
+			if (state.initDone) {
+				const char* readyLine = "LORA READY: short=JOIN long=OTAA 2-6s";
+				acceptScrollText(readyScroll, readyLine, u8g2, " ", 200);
+				drawMarqueeLoop(u8g2, 42, readyScroll, " ", 2, 40);
+			} else {
+				u8g2.drawStr(0, 42, "LORA: init...");
+			}
 
-		// 2) Join state + countdown
-		uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts : state.joinAttempts;
-		uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS : JOIN_MAX_ATTEMPTS;
-
-		if (countdown > 0) {
-			snprintf(line, sizeof(line), "JOIN %s %u/%u T-%lds",
-							 joinStateText(state.joinState),
-							 (unsigned)attempt, (unsigned)maxAttempt, (long)countdown);
 		} else {
-			snprintf(line, sizeof(line), "JOIN %s %u/%u",
-							 joinStateText(state.joinState),
-							 (unsigned)attempt, (unsigned)maxAttempt);
-		}
+			// gate open -> join status
+			uint32_t now = millis();
+			int32_t countdown = 0;
+			if (state.nextActionMs > now) {
+				countdown = (int32_t)((state.nextActionMs - now) / 1000);
+			}
 
+			uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts : state.joinAttempts;
+			uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS : JOIN_MAX_ATTEMPTS;
 
-		if (state.forceOtaaThisBoot) {
-			size_t L = strlen(line);
-			if (L < sizeof(line) - 7) strcat(line, " FORCE");
-		}
+			if (countdown > 0) {
+				snprintf(line, sizeof(line), "JOIN %s %u/%u T-%lds",
+								joinStateText(state.joinState),
+								(unsigned)attempt, (unsigned)maxAttempt, (long)countdown);
+			} else {
+				snprintf(line, sizeof(line), "JOIN %s %u/%u",
+								joinStateText(state.joinState),
+								(unsigned)attempt, (unsigned)maxAttempt);
+			}
 
-		if (state.gate == GateState::Running) {
+			if (state.forceOtaaThisBoot) {
+				size_t L = strlen(line);
+				if (L < sizeof(line) - 7) strcat(line, " FORCE");
+			}
+
 			u8g2.drawStr(0, 30, line);
+
+			// READY pas tonen zodra initDone == true
+			if (state.initDone) {
+				const char* readyLine = "LORA READY: short=JOIN long=OTAA 2-6s";
+				acceptScrollText(readyScroll, readyLine, u8g2, " ", 200);
+				drawMarqueeLoop(u8g2, 42, readyScroll, " ", 2, 40);
+			} else {
+				u8g2.drawStr(0, 42, "LORA: init...");
+			}
 		}
 
-		if (state.gate != GateState::Running) {
-			u8g2.drawStr(0, 42, "LORA: idle");
-		} else {
-			const char* readyLine = "LORA READY: short=JOIN long=OTAA";
-			acceptScrollText(readyScroll, readyLine, u8g2, " ", 200);
-			drawMarqueeLoop(u8g2, 42, readyScroll, " ", 2, 40);
-		}
-
-		// 3) GPS line: aaneengesloten marquee loop met " <<< " ertussen
+		// 3) GPS line
 		if (gpsLine) {
 			acceptScrollText(gpsScroll, gpsLine, u8g2, " <<< ", 200);
 		}
@@ -560,6 +580,8 @@ struct DisplayManager {
 
 		u8g2.sendBuffer();
 	}
+
+
 
 	void showModeMessage(const char* line) {
 		u8g2.clearBuffer();
@@ -888,35 +910,44 @@ static size_t buildPayload(uint8_t* out, size_t maxLen, const CurrentFix& fix) {
 }
 
 // ---- Boot button ----
+// ---- Boot button ----
 struct BootButton {
-	static constexpr uint32_t DEBOUNCE_MS = 25;
+	static constexpr uint32_t DEBOUNCE_MS	= 25;
 	static constexpr uint32_t MIN_PRESS_MS = 20;
 	static constexpr uint32_t MAX_SHORT_MS = 1200;
 
 	bool lastRawDown = false;
 	uint32_t rawChangeMs = 0;
+
 	bool debouncedDown = false;
 	uint32_t pressStartMs = 0;
-	bool holdUiActive = false;
-	bool longReady = false;
+
+	// long-press gating
+	bool longArmed = false;			// wordt pas true NA 2000ms hold
 	bool tooLong = false;
+
 	bool shortEvent = false;
 	bool longTriggerEvent = false;
 
 	bool initialized = false;
-	bool lastDebouncedDown = false;
+
 	uint32_t heldMs = 0;
 
 	void begin() {
 		pinMode(BOOT_PIN, INPUT_PULLUP);
+		uint32_t now = millis();
 		lastRawDown = (digitalRead(BOOT_PIN) == LOW);
-		rawChangeMs = millis();
+		rawChangeMs = now;
 		debouncedDown = lastRawDown;
-		lastDebouncedDown = debouncedDown;
+
 		if (debouncedDown) {
-			pressStartMs = rawChangeMs;
+			pressStartMs = now;
 		}
-		updateHoldState(rawChangeMs);
+		longArmed = false;
+		tooLong = false;
+		shortEvent = false;
+		longTriggerEvent = false;
+		heldMs = 0;
 		initialized = true;
 	}
 
@@ -926,28 +957,56 @@ struct BootButton {
 		uint32_t now = millis();
 		bool rawDown = (digitalRead(BOOT_PIN) == LOW);
 
+		// raw edge tracking
 		if (rawDown != lastRawDown) {
 			lastRawDown = rawDown;
 			rawChangeMs = now;
 		}
 
-		if (now - rawChangeMs >= DEBOUNCE_MS && rawDown != debouncedDown) {
+		// debounce -> update debouncedDown
+		bool prevDebounced = debouncedDown;
+		if ((now - rawChangeMs) >= DEBOUNCE_MS) {
 			debouncedDown = rawDown;
-			if (debouncedDown) {
-				pressStartMs = now;
+		}
+
+		// on press (debounced)
+		if (!prevDebounced && debouncedDown) {
+			pressStartMs = now;
+			longArmed = false;
+			tooLong = false;
+		}
+
+		// while held
+		if (debouncedDown) {
+			heldMs = now - pressStartMs;
+
+			// arm long only after MIN reached
+			if (!longArmed && heldMs >= FORCE_OTAA_MIN_MS) {
+				longArmed = true;
+			}
+			// mark too long
+			if (heldMs > FORCE_OTAA_MAX_MS) {
+				tooLong = true;
 			}
 		}
 
-		if (lastDebouncedDown && !debouncedDown) {
+		// on release (debounced)
+		if (prevDebounced && !debouncedDown) {
 			uint32_t pressMs = now - pressStartMs;
-			if (pressMs >= FORCE_OTAA_MIN_MS && pressMs <= FORCE_OTAA_MAX_MS) {
+
+			// LONG triggers only if armed AND not too long
+			if (longArmed && !tooLong && pressMs <= FORCE_OTAA_MAX_MS) {
 				longTriggerEvent = true;
 			} else if (pressMs >= MIN_PRESS_MS && pressMs <= MAX_SHORT_MS) {
+				// otherwise normal short
 				shortEvent = true;
 			}
+
+			// reset hold state
+			heldMs = 0;
+			longArmed = false;
+			tooLong = false;
 		}
-		lastDebouncedDown = debouncedDown;
-		updateHoldState(now);
 	}
 
 	bool consumeShortPress() {
@@ -956,35 +1015,23 @@ struct BootButton {
 		return true;
 	}
 
-	bool inHoldUi() const {
-		return holdUiActive;
-	}
-
 	bool consumeLongPressTrigger() {
 		if (!longTriggerEvent) return false;
 		longTriggerEvent = false;
 		return true;
 	}
 
+bool inHoldUi() const {
+	// toon hold UI zodra knop debounced down is
+	return debouncedDown;
+}
+
+
 	uint32_t getHeldMs() const {
 		return heldMs;
 	}
-
-private:
-	void updateHoldState(uint32_t now) {
-		if (debouncedDown) {
-			holdUiActive = true;
-			heldMs = now - pressStartMs;
-			longReady = (heldMs >= FORCE_OTAA_MIN_MS && heldMs <= FORCE_OTAA_MAX_MS);
-			tooLong = (heldMs > FORCE_OTAA_MAX_MS);
-		} else {
-			holdUiActive = false;
-			heldMs = 0;
-			longReady = false;
-			tooLong = false;
-		}
-	}
 };
+
 
 static BootButton bootButton;
 
@@ -1170,24 +1217,23 @@ static void updateUplinkFlow() {
 void setup() {
 	Serial.begin(115200);
 	delay(200);
-	Serial.println("Boot");
 
-	if (!beginPower_AXP2101_Wire1()) {
-		Serial.println("PMU init failed");
-	}
+	// 1) zo vroeg mogelijk knop actief
+	bootButton.begin();
+	app.inputReady = true;
 
-	Serial.printf("PMU SYS=%.2f VBUS=%.2f BATT=%.2f VBUS_IN=%d BAT_CONN=%d\n",
-				 (double)axp.getSystemVoltage(), (double)axp.getVbusVoltage(),
-				 (double)axp.getBattVoltage(), axp.isVbusIn(),
-				 axp.isBatteryConnect());
-
+	// 2) init hardware
+	beginPower_AXP2101_Wire1();
 	displayManager.begin();
 	disableRadios();
 	gpsStart();
 
-	bootButton.begin();
+	// 3) nu is alles “klaar”
+	app.initDone = true;
+
 	resetJoinState();
 }
+
 
 void loop() {
 	uint32_t now = millis();
@@ -1197,11 +1243,14 @@ void loop() {
 	updateChargeLed();
 
 	if (bootButton.consumeShortPress()) {
-		if (app.gate != GateState::Running) {
-			app.gate = GateState::Running;
+		if (!app.initDone) {
+			// nog niet klaar: negeer (of toon evt "INIT...")
+		} else {
+			if (app.gate != GateState::Running) app.gate = GateState::Running;
+			resetJoinState();
 		}
-		resetJoinState();
 	}
+
 
 	if (app.gate == GateState::Running && bootButton.consumeLongPressTrigger()) {
 		forceOtaaReset();
