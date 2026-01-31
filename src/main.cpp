@@ -37,10 +37,10 @@ static constexpr int LORA_DIO1 = 1;
 static constexpr int LORA_BUSY = 4;
 
 // GPS (L76K)
-static constexpr uint8_t GPS_RX_PIN = 9;   // ESP RX <- GNSS TX
-static constexpr uint8_t GPS_TX_PIN = 8;   // ESP TX -> GNSS RX
-static constexpr uint8_t GPS_EN_PIN = 7;   // GPS_EN
-static constexpr uint8_t GPS_PPS_PIN = 6;  // PPS (optional)
+static constexpr uint8_t GPS_RX_PIN = 9;	 // ESP RX <- GNSS TX
+static constexpr uint8_t GPS_TX_PIN = 8;	 // ESP TX -> GNSS RX
+static constexpr uint8_t GPS_EN_PIN = 7;	 // GPS_EN
+static constexpr uint8_t GPS_PPS_PIN = 6;	// PPS (optional)
 static constexpr uint32_t GPS_BAUD = 9600;
 
 // ---------------- App settings (tunable) ----------------
@@ -119,6 +119,8 @@ struct AppState {
 	bool joined = false;
 	bool sessionRestored = false;
 	uint8_t testUplinkBackoff = 0;
+	BootAction bootAction = BootAction::Normal;
+	bool forceOtaaThisBoot = false;
 };
 
 static AppState app;
@@ -183,8 +185,8 @@ struct PowerManager {
 		axp.enableBattDetection();
 		axp.enableTemperatureMeasure();
 
-		axp.setPowerChannelVoltage(XPOWERS_ALDO4, 3300);
-		axp.enablePowerOutput(XPOWERS_ALDO4);
+		axp.setALDO4Voltage(3300);
+		axp.enableALDO4();
 
 		axp.setALDO1Voltage(3300);
 		axp.enableALDO1();
@@ -323,6 +325,7 @@ static void renderGpsLine(char* out, size_t outLen) {
 }
 
 // ---- DisplayManager (OLED) ----
+// ---- DisplayManager (OLED) ----
 struct DisplayManager {
 	void begin() {
 		u8g2.begin();
@@ -344,42 +347,167 @@ struct DisplayManager {
 	static const char* loraErrLabel(int16_t err, bool uplinkOk) {
 		if (uplinkOk) return "OK";
 		switch (err) {
-			case RADIOLIB_ERR_NONE:
-				return "NONE";
+			case RADIOLIB_ERR_NONE: return "NONE";
 #ifdef RADIOLIB_ERR_JOIN_FAILED
-			case RADIOLIB_ERR_JOIN_FAILED:
-				return "JOIN_FAILED";
+			case RADIOLIB_ERR_JOIN_FAILED: return "JOIN_FAILED";
 #endif
 #ifdef RADIOLIB_ERR_NO_JOIN_ACCEPT
-			case RADIOLIB_ERR_NO_JOIN_ACCEPT:
-				return "NO_ACCEPT";
+			case RADIOLIB_ERR_NO_JOIN_ACCEPT: return "NO_ACCEPT";
 #endif
 #ifdef RADIOLIB_ERR_RX_TIMEOUT
-			case RADIOLIB_ERR_RX_TIMEOUT:
-				return "TIMEOUT";
+			case RADIOLIB_ERR_RX_TIMEOUT: return "TIMEOUT";
 #endif
 #ifdef RADIOLIB_ERR_TIMEOUT
-			case RADIOLIB_ERR_TIMEOUT:
-				return "TIMEOUT";
+			case RADIOLIB_ERR_TIMEOUT: return "TIMEOUT";
 #endif
 #ifdef RADIOLIB_ERR_MIC_MISMATCH
-			case RADIOLIB_ERR_MIC_MISMATCH:
-				return "MIC_MISMATCH";
+			case RADIOLIB_ERR_MIC_MISMATCH: return "MIC_MISMATCH";
 #endif
 #ifdef RADIOLIB_ERR_INVALID_FCNT
-			case RADIOLIB_ERR_INVALID_FCNT:
-				return "INVALID_FCNT";
+			case RADIOLIB_ERR_INVALID_FCNT: return "INVALID_FCNT";
 #endif
 #ifdef RADIOLIB_ERR_DOWNLINK_MALFORMED
-			case RADIOLIB_ERR_DOWNLINK_MALFORMED:
-				return "DOWNLINK_BAD";
+			case RADIOLIB_ERR_DOWNLINK_MALFORMED: return "DOWNLINK_BAD";
 #endif
-			default:
-				return "OTHER";
+			default: return "OTHER";
 		}
 	}
 
+	struct ScrollText {
+		int16_t x = 0;
+		uint32_t lastStepMs = 0;
+
+		// stabiele buffer
+		char buf[96] = {0};
+		uint32_t lastAcceptMs = 0;
+
+		// widths in pixels
+		int16_t textW = 0;
+		int16_t sepW = 0;
+		bool scrolling = false;
+	};
+
+	static ScrollText gpsScroll;
+
+	static void acceptScrollText(ScrollText& st, const char* newText, U8G2& u8g2,
+															 const char* sep = " - ",
+															 uint32_t minUpdateMs = 1000) {
+		if (!newText) newText = "";
+
+		// gelijk? niks doen
+		if (strncmp(st.buf, newText, sizeof(st.buf)) == 0) return;
+
+		uint32_t now = millis();
+
+		// throttle
+		if (st.lastAcceptMs != 0 && (now - st.lastAcceptMs) < minUpdateMs) {
+			return;
+		}
+
+		strncpy(st.buf, newText, sizeof(st.buf) - 1);
+		st.buf[sizeof(st.buf) - 1] = 0;
+		st.lastAcceptMs = now;
+
+		st.textW = u8g2.getStrWidth(st.buf);
+		st.sepW	= u8g2.getStrWidth(sep);
+		int16_t screenW = u8g2.getDisplayWidth();
+		bool scrollingNow = (st.textW > screenW);
+
+		// als hij net gaat scrollen: begin vanaf start
+		if (!st.scrolling && scrollingNow) {
+			st.x = 0;
+			st.lastStepMs = now;
+		}
+
+		st.scrolling = scrollingNow;
+	}
+
+	void showBootHold(uint32_t heldMs, bool inWindow) {
+		u8g2.clearBuffer();
+		u8g2.setFont(u8g2_font_6x10_tf);
+
+		char line1[32];
+		char line2[32];
+
+		snprintf(line1, sizeof(line1), "BOOT hold: %lums", (unsigned long)heldMs);
+		if (inWindow) {
+			snprintf(line2, sizeof(line2), "Release: FORCE OTAA");
+		} else {
+			snprintf(line2, sizeof(line2), "Hold 2-6s for OTAA");
+		}
+
+		u8g2.drawStr(0, 24, line1);
+		u8g2.drawStr(0, 40, line2);
+
+		// mini “progress” balkje 0..6s
+		const uint16_t cap = FORCE_OTAA_MAX_MS;
+		uint16_t w = (heldMs >= cap) ? 128 : (uint16_t)((heldMs * 128UL) / cap);
+		u8g2.drawFrame(0, 52, 128, 10);
+		u8g2.drawBox(1, 53, (w > 2 ? w - 2 : 0), 8);
+
+		// extra statusregel "READY"
+		if (heldMs >= FORCE_OTAA_MIN_MS && heldMs <= FORCE_OTAA_MAX_MS) {
+			u8g2.drawStr(0, 12, "FORCE OTAA: READY");
+		} else if (heldMs > FORCE_OTAA_MAX_MS) {
+			u8g2.drawStr(0, 12, "FORCE OTAA: TOO LONG");
+		} else {
+			u8g2.drawStr(0, 12, "FORCE OTAA: NOT READY");
+		}
+
+		u8g2.sendBuffer();
+	}
+
+
+	static void drawMarqueeLoop(U8G2& u8g2, int y, ScrollText& st,
+															const char* sep = " - ",
+															uint8_t speedPx = 1,
+															uint16_t stepMs = 40) {
+		const char* text = st.buf;
+		if (!text || !text[0]) return;
+
+		const int16_t screenW = u8g2.getDisplayWidth();
+		const int16_t textW = st.textW > 0 ? st.textW : u8g2.getStrWidth(text);
+
+		// past -> statisch
+		if (textW <= screenW) {
+			st.x = 0;
+			u8g2.drawStr(0, y, text);
+			return;
+		}
+
+		const int16_t sepW = st.sepW > 0 ? st.sepW : u8g2.getStrWidth(sep);
+		const int16_t periodW = textW + sepW;	 // 1 cyclus: TEXT + SEP
+		uint32_t now = millis();
+
+		if (now - st.lastStepMs >= stepMs) {
+			st.lastStepMs = now;
+			st.x -= (int16_t)speedPx;
+
+			// modulo loop (aaneengesloten)
+			if (st.x <= -periodW) {
+				st.x += periodW;
+			}
+		}
+
+		// Teken twee keer zodat het scherm altijd gevuld blijft:
+		// [TEXT][SEP][TEXT][SEP]...
+		int16_t x0 = st.x;
+
+		// 1) eerste tekst
+		u8g2.drawStr(x0, y, text);
+
+		// 2) separator direct erachter
+		u8g2.drawStr(x0 + textW, y, sep);
+
+		// 3) tweede tekst (begin) voor de loop
+		u8g2.drawStr(x0 + periodW, y, text);
+
+		// 4) (optioneel) nog een sep, helpt bij heel brede fonts
+		u8g2.drawStr(x0 + periodW + textW, y, sep);
+	}
+
 	void render(const AppState& state, uint16_t battMv, uint8_t battPct, const char* gpsLine) {
+		(void)battMv;
 		u8g2.clearBuffer();
 		u8g2.setFont(u8g2_font_6x10_tf);
 
@@ -388,8 +516,7 @@ struct DisplayManager {
 		// 1) Battery
 		float battV = readBatteryVoltageV();
 		if (battV > 0.0f) {
-			snprintf(line, sizeof(line), "BAT %.2fV %u%%", (double)battV,
-					 (unsigned)battPct);
+			snprintf(line, sizeof(line), "BAT %.2fV %u%%", (double)battV, (unsigned)battPct);
 		} else {
 			snprintf(line, sizeof(line), "BAT --.-V %u%%", (unsigned)battPct);
 		}
@@ -397,7 +524,6 @@ struct DisplayManager {
 
 		if (state.gate != GateState::Running) {
 			u8g2.drawStr(0, 30, "LORA: press BOOT");
-			// gewoon doorrenderen, geen return
 		}
 
 		uint32_t now = millis();
@@ -407,20 +533,23 @@ struct DisplayManager {
 		}
 
 		// 2) Join state + countdown
+		uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts : state.joinAttempts;
+		uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS : JOIN_MAX_ATTEMPTS;
+
 		if (countdown > 0) {
-			uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts
-															 : state.joinAttempts;
-			uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS
-															 : JOIN_MAX_ATTEMPTS;
-			snprintf(line, sizeof(line), "JOIN %s %u/%u T-%lds", joinStateText(state.joinState),
-					 (unsigned)attempt, (unsigned)maxAttempt, (long)countdown);
+			snprintf(line, sizeof(line), "JOIN %s %u/%u T-%lds",
+							 joinStateText(state.joinState),
+							 (unsigned)attempt, (unsigned)maxAttempt, (long)countdown);
 		} else {
-			uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts
-															 : state.joinAttempts;
-			uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS
-															 : JOIN_MAX_ATTEMPTS;
-			snprintf(line, sizeof(line), "JOIN %s %u/%u", joinStateText(state.joinState),
-					 (unsigned)attempt, (unsigned)maxAttempt);
+			snprintf(line, sizeof(line), "JOIN %s %u/%u",
+							 joinStateText(state.joinState),
+							 (unsigned)attempt, (unsigned)maxAttempt);
+		}
+
+
+		if (state.forceOtaaThisBoot) {
+			size_t L = strlen(line);
+			if (L < sizeof(line) - 7) strcat(line, " FORCE");
 		}
 
 		if (state.gate == GateState::Running) {
@@ -431,14 +560,17 @@ struct DisplayManager {
 			u8g2.drawStr(0, 42, "LORA: idle");
 		} else {
 			bool uplinkOk = (state.uplinkResult == UplinkResult::Ok);
-			snprintf(line, sizeof(line), "LORA %d %s", (int)state.lastLoraErr,
-					 loraErrLabel(state.lastLoraErr, uplinkOk));
+			snprintf(line, sizeof(line), "LORA %d %s",
+							 (int)state.lastLoraErr,
+							 loraErrLabel(state.lastLoraErr, uplinkOk));
 			u8g2.drawStr(0, 42, line);
 		}
 
+		// 3) GPS line: aaneengesloten marquee loop met " <<< " ertussen
 		if (gpsLine) {
-			u8g2.drawStr(0, 54, gpsLine);
+			acceptScrollText(gpsScroll, gpsLine, u8g2, " <<< ", 200);
 		}
+		drawMarqueeLoop(u8g2, 54, gpsScroll, " <<< ", 3, 40);
 
 		u8g2.sendBuffer();
 	}
@@ -451,6 +583,9 @@ struct DisplayManager {
 	}
 };
 
+
+
+DisplayManager::ScrollText DisplayManager::gpsScroll;
 static PowerManager powerManager;
 static DisplayManager displayManager;
 
@@ -856,14 +991,28 @@ struct BootGate {
 
 static BootGate bootGate;
 
-static BootAction detectBootAction() {
+static BootAction detectBootActionWithOled() {
 	pinMode(BOOT_PIN, INPUT_PULLUP);
+
+	// Niet ingedrukt: normaal
 	if (digitalRead(BOOT_PIN) != LOW) return BootAction::Normal;
 
 	uint32_t startMs = millis();
+	uint32_t lastDraw = 0;
+
 	while (digitalRead(BOOT_PIN) == LOW) {
-		uint32_t elapsed = millis() - startMs;
-		if (elapsed > FORCE_OTAA_MAX_MS) {
+		uint32_t now = millis();
+		uint32_t held = now - startMs;
+
+		bool inWindow = (held >= FORCE_OTAA_MIN_MS && held <= FORCE_OTAA_MAX_MS);
+
+		if (now - lastDraw >= 80) { // vlot maar niet te druk
+			lastDraw = now;
+			displayManager.showBootHold(held, inWindow);
+		}
+
+		if (held > FORCE_OTAA_MAX_MS) {
+			// te lang -> normaal
 			return BootAction::Normal;
 		}
 		delay(10);
@@ -875,6 +1024,7 @@ static BootAction detectBootAction() {
 	}
 	return BootAction::Normal;
 }
+
 
 static void resetJoinState() {
 	app.joinState = JoinState::Radio;
@@ -1046,17 +1196,26 @@ void setup() {
 				 (double)axp.getBattVoltage(), axp.isVbusIn(),
 				 axp.isBatteryConnect());
 
-	gpsStart();
-
 	displayManager.begin();
 	disableRadios();
+	gpsStart();
 
-	BootAction bootAction = detectBootAction();
+	BootAction bootAction = detectBootActionWithOled();
+	app.bootAction = bootAction;
+	app.forceOtaaThisBoot = (bootAction == BootAction::ForceOTAA);
+
 	if (bootAction == BootAction::ForceOTAA) {
 		lorawanManager.clearSession();
-		displayManager.showModeMessage("MODE: FORCE OTAA");
-		delay(1500);
+
+		LoRaWANSession tmp;
+		bool stillThere = lorawanManager.loadSession(tmp);
+		displayManager.showModeMessage(
+				stillThere ? "CLEAR FAIL?!" : "SESSION CLEARED"
+		);
+
+		delay(1200);
 	}
+
 
 	bootGate.begin();
 	if (bootAction == BootAction::ForceOTAA) {
