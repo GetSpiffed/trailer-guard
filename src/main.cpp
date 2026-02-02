@@ -426,7 +426,7 @@ struct DisplayManager {
 
 		const char* statusLine = nullptr;
 
-		// 0..2s: join hint
+		// 0..1,2s: join hint
 		if (heldMs < FORCE_OTAA_MIN_MS) {
 			statusLine = "RELEASE: JOIN (short)";
 		} 
@@ -440,7 +440,7 @@ struct DisplayManager {
 		}
 
 		acceptScrollText(holdScroll, statusLine, u8g2, " - ", 120);
-		drawMarqueeLoop(u8g2, 12, holdScroll, " - ", 2, 40);
+		drawMarqueeLoop(u8g2, 12, holdScroll, " <<< ", 3, 40);
 
 		// tijdregel
 		char line1[32];
@@ -522,20 +522,19 @@ struct DisplayManager {
 		}
 		u8g2.drawStr(0, 12, line);
 
-		// gate closed -> instructie + READY zodra initDone
+		// 2) Middle area
 		if (state.gate != GateState::Running) {
-			u8g2.drawStr(0, 30, "LORA: press BOOT");
-
+			// gate closed -> instructie + READY zodra initDone
 			if (state.initDone) {
-				const char* readyLine = "LORA READY: short=JOIN long=OTAA 2-6s";
+				const char* readyLine = "LORA: S:JOIN	L:OTAA";
 				acceptScrollText(readyScroll, readyLine, u8g2, " ", 200);
-				drawMarqueeLoop(u8g2, 42, readyScroll, " ", 2, 40);
+				drawMarqueeLoop(u8g2, 42, readyScroll, " <<< ", 3, 40);
 			} else {
 				u8g2.drawStr(0, 42, "LORA: init...");
 			}
 
 		} else {
-			// gate open -> join status
+			// gate open -> join status (netjes: geen "JOIN JOIN")
 			uint32_t now = millis();
 			int32_t countdown = 0;
 			if (state.nextActionMs > now) {
@@ -545,14 +544,16 @@ struct DisplayManager {
 			uint8_t attempt = (state.joinState == JoinState::Radio) ? state.radioInitAttempts : state.joinAttempts;
 			uint8_t maxAttempt = (state.joinState == JoinState::Radio) ? RADIO_INIT_MAX_ATTEMPTS : JOIN_MAX_ATTEMPTS;
 
-			if (countdown > 0) {
-				snprintf(line, sizeof(line), "JOIN %s %u/%u T-%lds",
-								joinStateText(state.joinState),
-								(unsigned)attempt, (unsigned)maxAttempt, (long)countdown);
+			const char* phase = joinStateText(state.joinState);
+
+			if (state.joinState == JoinState::Ok || state.joinState == JoinState::Fail) {
+				snprintf(line, sizeof(line), "LORA %s", phase);
+			} else if (countdown > 0) {
+				snprintf(line, sizeof(line), "LORA %s %u/%u T-%lds",
+								phase, (unsigned)attempt, (unsigned)maxAttempt, (long)countdown);
 			} else {
-				snprintf(line, sizeof(line), "JOIN %s %u/%u",
-								joinStateText(state.joinState),
-								(unsigned)attempt, (unsigned)maxAttempt);
+				snprintf(line, sizeof(line), "LORA %s %u/%u",
+								phase, (unsigned)attempt, (unsigned)maxAttempt);
 			}
 
 			if (state.forceOtaaThisBoot) {
@@ -560,13 +561,14 @@ struct DisplayManager {
 				if (L < sizeof(line) - 7) strcat(line, " FORCE");
 			}
 
+			// --> Toon join statusregel
 			u8g2.drawStr(0, 30, line);
 
-			// READY pas tonen zodra initDone == true
+			// READY scroll eronder (zoals je al had)
 			if (state.initDone) {
-				const char* readyLine = "LORA READY: short=JOIN long=OTAA 2-6s";
+				const char* readyLine = "LORA: S:JOIN	L:OTAA";
 				acceptScrollText(readyScroll, readyLine, u8g2, " ", 200);
-				drawMarqueeLoop(u8g2, 42, readyScroll, " ", 2, 40);
+				drawMarqueeLoop(u8g2, 42, readyScroll, " <<< ", 3, 40);
 			} else {
 				u8g2.drawStr(0, 42, "LORA: init...");
 			}
@@ -659,6 +661,40 @@ struct LoRaWanManager {
 		prefs.remove("session");
 		prefs.end();
 	}
+
+	bool otaaInited = false;
+
+	bool beginOtaaOnce(AppState& state) {
+		if (otaaInited) return true;
+
+		int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
+		if (st != RADIOLIB_ERR_NONE) {
+			state.lastLoraErr = st;
+			return false;
+		}
+
+		otaaInited = true;
+		state.lastLoraErr = RADIOLIB_ERR_NONE;
+		return true;
+	}
+
+	bool activateOtaa(AppState& state) {
+		int16_t st = node.activateOTAA();
+		if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
+			state.lastLoraErr = st;
+			return false;
+		}
+
+		// session opslaan zoals je al deed
+		LoRaWANSession session;
+		if (fetchSession(state, session)) {
+			(void)saveSession(session);
+		}
+
+		state.lastLoraErr = RADIOLIB_ERR_NONE;
+		return true;
+	}
+
 
 	// ---------- Session ↔ node glue (compat) ----------
 	template <typename NodeT, typename SessionT>
@@ -1078,6 +1114,14 @@ static void updateJoinFlow() {
 
 	uint32_t now = millis();
 
+	// OTAA init maar 1x per join-run (niet bij elke attempt)
+	static bool otaaInited = false;
+
+	// als we uit Join gaan of gate dicht is, reset init-flag
+	if (app.joinState != JoinState::Join) {
+		otaaInited = false;
+	}
+
 	switch (app.joinState) {
 		case JoinState::Radio: {
 			if (now < app.nextActionMs) return;
@@ -1096,6 +1140,7 @@ static void updateJoinFlow() {
 			}
 			break;
 		}
+
 		case JoinState::Restore: {
 			LoRaWANSession session;
 			if (lorawanManager.loadSession(session) &&
@@ -1110,6 +1155,7 @@ static void updateJoinFlow() {
 			}
 			break;
 		}
+
 		case JoinState::TestUplink: {
 			if (now < app.nextActionMs) return;
 
@@ -1135,7 +1181,6 @@ static void updateJoinFlow() {
 				currentFix.anchorLon = currentFix.lon;
 				currentFix.anchorValid = currentFix.hasFix;
 			} else if (isSessionInvalidError(st)) {
-				// echte sessie-fout: session wissen en opnieuw joinen
 				lorawanManager.clearSession();
 				app.sessionRestored = false;
 
@@ -1154,32 +1199,59 @@ static void updateJoinFlow() {
 
 		case JoinState::Join: {
 			if (now < app.nextActionMs) return;
+
 			if (app.joinAttempts >= JOIN_MAX_ATTEMPTS) {
 				app.joinState = JoinState::Fail;
 				return;
 			}
+
+			// init OTAA maar 1x
+			if (!otaaInited) {
+				int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
+				if (st != RADIOLIB_ERR_NONE) {
+					app.lastLoraErr = st;
+					app.nextActionMs = now + JOIN_RETRY_MS;
+					return;
+				}
+				otaaInited = true;
+			}
+
+			// attempt = alleen activateOTAA()
 			app.joinAttempts++;
-			bool ok = lorawanManager.join(app);
-			if (ok) {
-				app.joined = true;
-				app.joinState = JoinState::Ok;
-				app.testUplinkBackoff = 0;
-				app.nextUplinkMs = now + nextUplinkIntervalMs(currentFix);
-				currentFix.anchorLat = currentFix.lat;
-				currentFix.anchorLon = currentFix.lon;
-				currentFix.anchorValid = currentFix.hasFix;
-			} else {
+			int16_t st = node.activateOTAA();
+			if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
+				app.lastLoraErr = st;
 				app.joinState = JoinState::Join;
 				app.nextActionMs = now + JOIN_RETRY_MS;
+				return;
 			}
+
+			// success
+			app.lastLoraErr = RADIOLIB_ERR_NONE;
+			app.joined = true;
+			app.joinState = JoinState::Ok;
+			app.testUplinkBackoff = 0;
+
+			// session opslaan (zoals je al deed)
+			LoRaWANSession session;
+			if (lorawanManager.fetchSession(app, session)) {
+				lorawanManager.saveSession(session);
+			}
+
+			app.nextUplinkMs = now + nextUplinkIntervalMs(currentFix);
+			currentFix.anchorLat = currentFix.lat;
+			currentFix.anchorLon = currentFix.lon;
+			currentFix.anchorValid = currentFix.hasFix;
 			break;
 		}
+
 		case JoinState::Ok:
 		case JoinState::Fail:
 		default:
 			break;
 	}
 }
+
 
 static void updateUplinkFlow() {
 	if (!app.joined) return;
@@ -1241,23 +1313,32 @@ void loop() {
 	pumpGpsUartAndParse();
 	bootButton.update();
 	updateChargeLed();
-	if (app.gate != GateState::Running) {
-		bootButton.consumeLongPressTrigger();
-	}
 
-	if (bootButton.consumeShortPress()) {
-		if (!app.initDone) {
-			// nog niet klaar: negeer (of toon evt "INIT...")
+	// if (app.gate != GateState::Running) {
+	// 	bootButton.consumeLongPressTrigger();
+	// }
+
+	// LONG release (2–6s): Force OTAA + joinen
+	if (bootButton.consumeLongPressTrigger()) {
+		if (app.initDone) {
+			app.gate = GateState::Running;	 // join flow mag lopen
+			forceOtaaReset();								// wist session + zet joinState=Join
 		} else {
-			if (app.gate != GateState::Running) app.gate = GateState::Running;
-			resetJoinState();
+			displayManager.showModeMessage("INIT...");
+			delay(400);
+		}
+	}
+	// SHORT release (0–1200ms): normale join
+	else if (bootButton.consumeShortPress()) {
+		if (app.initDone) {
+			app.gate = GateState::Running;
+			resetJoinState();								// start flow (restore/test/join)
+		} else {
+			displayManager.showModeMessage("INIT...");
+			delay(400);
 		}
 	}
 
-
-	if (app.gate == GateState::Running && bootButton.consumeLongPressTrigger()) {
-		forceOtaaReset();
-	}
 
 	updateJoinFlow();
 	updateUplinkFlow();
