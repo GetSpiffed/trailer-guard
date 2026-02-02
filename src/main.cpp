@@ -1241,6 +1241,9 @@ void loop() {
 	pumpGpsUartAndParse();
 	bootButton.update();
 	updateChargeLed();
+	if (app.gate != GateState::Running) {
+		bootButton.consumeLongPressTrigger();
+	}
 
 	if (bootButton.consumeShortPress()) {
 		if (!app.initDone) {
