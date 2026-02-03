@@ -2,11 +2,13 @@
 
 #include <Arduino.h>
 
+// Hoofdtoestand van de applicatiegate.
 enum class GateState : uint8_t {
 	WaitingForBoot,
 	Running
 };
 
+// Fase van het LoRaWAN join-proces.
 enum class JoinState : uint8_t {
 	Radio,
 	Restore,
@@ -16,12 +18,14 @@ enum class JoinState : uint8_t {
 	Fail
 };
 
+// Resultaatstaat van de laatste uplink.
 enum class UplinkResult : uint8_t {
 	Idle,
 	Ok,
 	Fail
 };
 
+// Samengevatte runtime-state van de applicatie.
 struct AppState {
 	GateState gate = GateState::WaitingForBoot;
 	JoinState joinState = JoinState::Radio;
@@ -41,14 +45,20 @@ struct AppState {
 	bool initDone = false;
 };
 
+// Hoofdapplicatie die alle services aanstuurt.
 class App {
 public:
+	// Initialiseer hardware en services.
 	void begin();
+	// Voer de periodieke applicatielus uit.
 	void tick();
 
 private:
+	// Schakel WiFi/Bluetooth uit om energie te besparen.
 	void disableRadios();
+	// Zet join-gerelateerde state terug naar defaults.
 	void resetJoinState();
+	// Dwing een OTAA reset en herstart van het join-proces af.
 	void forceOtaaReset();
 
 	AppState state_;

@@ -12,6 +12,7 @@
 #include "services/LoraWanService.h"
 #include "services/TrackerService.h"
 
+// Bundelt hardwaredrivers en services voor gedeeld gebruik.
 class AppContext {
 public:
 	BootButton bootButton;
@@ -22,6 +23,7 @@ public:
 	LoraWanService lorawan;
 };
 
+// Globale contextinstantie voor de applicatie.
 static AppContext ctx;
 
 void App::begin() {
