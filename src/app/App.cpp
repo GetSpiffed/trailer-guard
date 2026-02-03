@@ -61,6 +61,7 @@ void App::resetJoinState() {
 	state_.joined = false;
 	state_.sessionRestored = false;
 	state_.testUplinkBackoff = 0;
+	state_.forceOtaaThisBoot = false;
 }
 
 void App::forceOtaaReset() {
