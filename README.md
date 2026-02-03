@@ -45,3 +45,33 @@ https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_
    - `git push --force --all`
    - `git push --force --tags`
 3) Roteer TTN keys na cleanup.
+
+## TODO
+
+- [ ] FORCE OTAA gedrag
+  - [x] 2–6s: clearSession()
+  - [ ] >6s: clearSession() + clearNonces() (factory reset)
+
+- [ ] DevNonce persistent maken
+  - [x] Nonces load na beginOTAA()
+  - [x] Nonces save na elke activateOTAA() (ok/fail)
+  - [ ] Factory reset flow testen met TTN reset
+
+- [ ] Join-flow opschonen
+  - [x] beginOTAA slechts 1× per join-run
+  - [ ] Edge cases testen (reboot tijdens join, lange hold, korte hold)
+
+- [ ] OLED UX
+  - [x] Compacte statusregels
+  - [ ] Factory reset feedback toevoegen
+  - [ ] eenduidige gebruik statusregels
+
+- [ ] Status (power) led
+  - [ ] single blink (every 30sec) when GPS FIX
+  - [ ] double blink (every 30sec) when LORA joined
+  - [ ] long blink (every 30sec) when both GPS  and LORA Joined
+
+- [ ] Deep sleep
+  - [ ] Wake on move (gyroscope and speed)
+  - [ ] send message every 5 minutes when awake
+

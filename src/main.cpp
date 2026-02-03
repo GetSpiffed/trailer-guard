@@ -526,7 +526,7 @@ struct DisplayManager {
 		if (state.gate != GateState::Running) {
 			// gate closed -> instructie + READY zodra initDone
 			if (state.initDone) {
-				const char* readyLine = "LORA: S:JOIN	L:OTAA";
+				const char* readyLine = "LORA: S:JOIN L:OTAA";
 				acceptScrollText(readyScroll, readyLine, u8g2, " ", 200);
 				drawMarqueeLoop(u8g2, 42, readyScroll, " <<< ", 3, 40);
 			} else {
@@ -566,7 +566,7 @@ struct DisplayManager {
 
 			// READY scroll eronder (zoals je al had)
 			if (state.initDone) {
-				const char* readyLine = "LORA: S:JOIN	L:OTAA";
+				const char* readyLine = "LORA: S:JOIN L:OTAA";
 				acceptScrollText(readyScroll, readyLine, u8g2, " ", 200);
 				drawMarqueeLoop(u8g2, 42, readyScroll, " <<< ", 3, 40);
 			} else {
@@ -618,6 +618,24 @@ struct StoredSession {
 	uint16_t size;
 	LoRaWANSession session;
 };
+
+// ---- LoRaWAN nonces storage (RadioLib OTAA DevNonce state) ----
+static constexpr uint32_t NONCES_MAGIC	 = 0x4E4F4E43u; // "NONC"
+static constexpr uint16_t NONCES_VERSION = 1;
+
+// RadioLib noemt dit vaak RADIOLIB_LORAWAN_NONCES_BUF_SIZE.
+// Fallback: als 'ie niet bestaat, pak 64 (veilig voor compile; pas evt aan als je build klaagt)
+#ifndef RADIOLIB_LORAWAN_NONCES_BUF_SIZE
+#define RADIOLIB_LORAWAN_NONCES_BUF_SIZE 64
+#endif
+
+struct StoredNonces {
+	uint32_t magic;
+	uint16_t version;
+	uint16_t size;
+	uint8_t	nonces[RADIOLIB_LORAWAN_NONCES_BUF_SIZE];
+};
+
 
 // ---- LoRaWAN Manager ----
 // Session-only persistence (RadioLib v7.5.x)
@@ -782,30 +800,6 @@ struct LoRaWanManager {
 		return true;
 	}
 
-	// ---------- OTAA join ----------
-	bool join(AppState& state) {
-		// 1) init OTAA
-		int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
-		if (st != RADIOLIB_ERR_NONE) {
-			state.lastLoraErr = st;
-			return false;
-		}
-
-		// 2) join
-		st = node.activateOTAA();
-		if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
-			state.lastLoraErr = st;
-			return false;
-		}
-
-		LoRaWANSession session;
-		if (fetchSession(state, session)) {
-			(void)saveSession(session);
-		}
-
-		state.lastLoraErr = RADIOLIB_ERR_NONE;
-		return true;
-	}
 
 	bool fetchSession(AppState& state, LoRaWANSession& session) {
 		int16_t st = getNodeSession(node, session, 0);
@@ -820,6 +814,70 @@ struct LoRaWanManager {
 	int16_t sendUplink(const uint8_t* payload, size_t len, uint8_t fport) {
 		return node.sendReceive(payload, len, fport);
 	}
+
+	// ---------- Nonces storage ----------
+	static bool loadNoncesToNode(AppState& state) {
+		Preferences prefs;
+		if (!prefs.begin("lorawan", true)) return false;
+
+		size_t len = prefs.getBytesLength("nonces");
+		if (len != sizeof(StoredNonces)) {
+			prefs.end();
+			return false;
+		}
+
+		StoredNonces stored{};
+		size_t read = prefs.getBytes("nonces", &stored, sizeof(stored));
+		prefs.end();
+
+		if (read != sizeof(stored)) return false;
+		if (stored.magic != NONCES_MAGIC) return false;
+		if (stored.version != NONCES_VERSION) return false;
+		if (stored.size != RADIOLIB_LORAWAN_NONCES_BUF_SIZE) return false;
+
+		int16_t st = node.setBufferNonces(stored.nonces);
+		if (st != RADIOLIB_ERR_NONE) {
+			state.lastLoraErr = st;
+			return false;
+		}
+
+		state.lastLoraErr = RADIOLIB_ERR_NONE;
+		return true;
+	}
+
+
+	static bool saveNoncesFromNode(AppState& state) {
+		StoredNonces stored{};
+		stored.magic	 = NONCES_MAGIC;
+		stored.version = NONCES_VERSION;
+		stored.size		= RADIOLIB_LORAWAN_NONCES_BUF_SIZE;
+
+		uint8_t* p = node.getBufferNonces();	 // <-- 7.5.0 API: geen args
+		if (!p) {
+			state.lastLoraErr = RADIOLIB_ERR_UNKNOWN;
+			return false;
+		}
+
+		memcpy(stored.nonces, p, RADIOLIB_LORAWAN_NONCES_BUF_SIZE);
+
+		Preferences prefs;
+		if (!prefs.begin("lorawan", false)) return false;
+		size_t written = prefs.putBytes("nonces", &stored, sizeof(stored));
+		prefs.end();
+
+		state.lastLoraErr = RADIOLIB_ERR_NONE;
+		return written == sizeof(stored);
+	}
+
+
+	// Optioneel: alleen voor debug / “factory reset”
+	static void clearNonces() {
+		Preferences prefs;
+		if (!prefs.begin("lorawan", false)) return;
+		prefs.remove("nonces");
+		prefs.end();
+	}
+
 };
 
 static LoRaWanManager lorawanManager;
@@ -945,12 +1003,12 @@ static size_t buildPayload(uint8_t* out, size_t maxLen, const CurrentFix& fix) {
 	return 8;
 }
 
-// ---- Boot button ----
+
 // ---- Boot button ----
 struct BootButton {
 	static constexpr uint32_t DEBOUNCE_MS	= 25;
 	static constexpr uint32_t MIN_PRESS_MS = 20;
-	static constexpr uint32_t MAX_SHORT_MS = 1200;
+	static constexpr uint32_t MAX_SHORT_MS = 1900;
 
 	bool lastRawDown = false;
 	uint32_t rawChangeMs = 0;
@@ -1114,13 +1172,17 @@ static void updateJoinFlow() {
 
 	uint32_t now = millis();
 
-	// OTAA init maar 1x per join-run (niet bij elke attempt)
+	// OTAA init state, alleen geldig zolang we "in deze join-run" zitten
 	static bool otaaInited = false;
+	static bool noncesLoaded = false;
+	static JoinState prevState = JoinState::Fail;
 
-	// als we uit Join gaan of gate dicht is, reset init-flag
-	if (app.joinState != JoinState::Join) {
+	// Detecteer entry naar JOIN (nieuwe join-run)
+	if (app.joinState == JoinState::Join && prevState != JoinState::Join) {
 		otaaInited = false;
+		noncesLoaded = false;
 	}
+	prevState = app.joinState;
 
 	switch (app.joinState) {
 		case JoinState::Radio: {
@@ -1180,16 +1242,16 @@ static void updateJoinFlow() {
 				currentFix.anchorLat = currentFix.lat;
 				currentFix.anchorLon = currentFix.lon;
 				currentFix.anchorValid = currentFix.hasFix;
+
 			} else if (isSessionInvalidError(st)) {
 				lorawanManager.clearSession();
 				app.sessionRestored = false;
 
 				app.joinState = JoinState::Join;
 				app.nextActionMs = now;
+
 			} else {
-				if (app.testUplinkBackoff < 5) {
-					app.testUplinkBackoff++;
-				}
+				if (app.testUplinkBackoff < 5) app.testUplinkBackoff++;
 				uint32_t backoffMs = JOIN_RETRY_MS + (uint32_t)app.testUplinkBackoff * 10000;
 				app.joinState = JoinState::TestUplink;
 				app.nextActionMs = now + backoffMs;
@@ -1205,7 +1267,7 @@ static void updateJoinFlow() {
 				return;
 			}
 
-			// init OTAA maar 1x
+			// beginOTAA exact 1x per join-run
 			if (!otaaInited) {
 				int16_t st = node.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
 				if (st != RADIOLIB_ERR_NONE) {
@@ -1214,14 +1276,21 @@ static void updateJoinFlow() {
 					return;
 				}
 				otaaInited = true;
+
+				// Nonces zetten NA beginOTAA(), ook maar 1x
+				(void)LoRaWanManager::loadNoncesToNode(app);
+				noncesLoaded = true;
 			}
 
-			// attempt = alleen activateOTAA()
 			app.joinAttempts++;
+
 			int16_t st = node.activateOTAA();
+
+			// Nonces altijd opslaan (ook bij fail)
+			(void)LoRaWanManager::saveNoncesFromNode(app);
+
 			if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
 				app.lastLoraErr = st;
-				app.joinState = JoinState::Join;
 				app.nextActionMs = now + JOIN_RETRY_MS;
 				return;
 			}
@@ -1232,7 +1301,6 @@ static void updateJoinFlow() {
 			app.joinState = JoinState::Ok;
 			app.testUplinkBackoff = 0;
 
-			// session opslaan (zoals je al deed)
 			LoRaWANSession session;
 			if (lorawanManager.fetchSession(app, session)) {
 				lorawanManager.saveSession(session);
@@ -1251,6 +1319,7 @@ static void updateJoinFlow() {
 			break;
 	}
 }
+
 
 
 static void updateUplinkFlow() {
@@ -1328,7 +1397,7 @@ void loop() {
 			delay(400);
 		}
 	}
-	// SHORT release (0–1200ms): normale join
+	// SHORT release (0–1900ms): normale join
 	else if (bootButton.consumeShortPress()) {
 		if (app.initDone) {
 			app.gate = GateState::Running;
