@@ -8,6 +8,18 @@ enum class GateState : uint8_t {
 	Running
 };
 
+// Globale boot/wakeup-indicatie voor startupgedrag.
+enum class BootWakeCause : uint8_t {
+	ColdBoot,
+	DeepSleepWake
+};
+
+// Hoog-niveau startupmodus voor het openen van de gate.
+enum class StartupMode : uint8_t {
+	ManualStart,
+	AutoStart
+};
+
 // Fase van het LoRaWAN join-proces.
 enum class JoinState : uint8_t {
 	Radio,
@@ -28,6 +40,9 @@ enum class UplinkResult : uint8_t {
 // Samengevatte runtime-state van de applicatie.
 struct AppState {
 	GateState gate = GateState::WaitingForBoot;
+	BootWakeCause wakeCause = BootWakeCause::ColdBoot;
+	StartupMode startupMode = StartupMode::ManualStart;
+	uint8_t resetReason = 0;
 	JoinState joinState = JoinState::Radio;
 	UplinkResult uplinkResult = UplinkResult::Idle;
 	int16_t lastLoraErr = 0;
@@ -60,6 +75,12 @@ private:
 	void resetJoinState();
 	// Dwing een OTAA reset en herstart van het join-proces af.
 	void forceOtaaReset();
+	// Start het netwerkpad en open de gate.
+	void startNetwork();
+	// Detecteer boot/wakeup-informatie.
+	void detectBootInfo();
+	// Bepaal de startupmodus op basis van de bootinformatie.
+	static StartupMode determineStartupMode(BootWakeCause cause);
 
 	AppState state_;
 };

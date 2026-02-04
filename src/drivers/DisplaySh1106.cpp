@@ -162,7 +162,9 @@ void DisplaySh1106::renderMain(const AppState& state, float battVoltageV, uint8_
 
 	if (state.gate != GateState::Running) {
 		if (state.initDone) {
-			const char* readyLine = "LORA: S:JOIN L:OTAA";
+			const char* readyLine = (state.startupMode == StartupMode::AutoStart)
+										 ? "AUTO START"
+										 : "READY: short=start long=otaa";
 			acceptScrollText(readyScroll_, readyLine, u8g2_, " ", 200);
 			drawMarqueeLoop(u8g2_, 42, readyScroll_, " <<< ", 3, 40);
 		} else {
@@ -200,7 +202,9 @@ void DisplaySh1106::renderMain(const AppState& state, float battVoltageV, uint8_
 		u8g2_.drawStr(0, 30, line);
 
 		if (state.initDone) {
-			const char* readyLine = "LORA: S:JOIN L:OTAA";
+			const char* readyLine = (state.startupMode == StartupMode::AutoStart)
+										 ? "AUTO START"
+										 : "READY: short=start long=otaa";
 			acceptScrollText(readyScroll_, readyLine, u8g2_, " ", 200);
 			drawMarqueeLoop(u8g2_, 42, readyScroll_, " <<< ", 3, 40);
 		} else {

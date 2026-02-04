@@ -1,3 +1,5 @@
+// Added StartupMode + boot/wakeup detection to prep for deep sleep.
+// TODO: Hook actual deep sleep entry where determineStartupMode() decides AutoStart.
 #include "app/App.h"
 
 #include <WiFi.h>
@@ -26,6 +28,37 @@ public:
 // Globale contextinstantie voor de applicatie.
 static AppContext ctx;
 
+namespace {
+const char* wakeCauseLabel(esp_sleep_wakeup_cause_t cause) {
+	switch (cause) {
+		case ESP_SLEEP_WAKEUP_UNDEFINED: return "COLD/RESET";
+		case ESP_SLEEP_WAKEUP_TIMER: return "TIMER";
+		case ESP_SLEEP_WAKEUP_EXT0: return "EXT0";
+		case ESP_SLEEP_WAKEUP_EXT1: return "EXT1";
+		case ESP_SLEEP_WAKEUP_ULP: return "ULP";
+		case ESP_SLEEP_WAKEUP_GPIO: return "GPIO";
+		case ESP_SLEEP_WAKEUP_UART: return "UART";
+		default: return "OTHER";
+	}
+}
+
+const char* resetReasonLabel(esp_reset_reason_t reason) {
+	switch (reason) {
+		case ESP_RST_POWERON: return "POWERON";
+		case ESP_RST_EXT: return "EXT";
+		case ESP_RST_SW: return "SW";
+		case ESP_RST_PANIC: return "PANIC";
+		case ESP_RST_INT_WDT: return "INT_WDT";
+		case ESP_RST_TASK_WDT: return "TASK_WDT";
+		case ESP_RST_WDT: return "WDT";
+		case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+		case ESP_RST_BROWNOUT: return "BROWNOUT";
+		case ESP_RST_SDIO: return "SDIO";
+		default: return "UNKNOWN";
+	}
+}
+} // namespace
+
 void App::begin() {
 	Serial.begin(115200);
 	delay(200);
@@ -39,8 +72,14 @@ void App::begin() {
 	ctx.gps.begin();
 
 	state_.initDone = true;
-	resetJoinState();
-	ctx.lorawan.resetJoinTracking();
+	detectBootInfo();
+
+	if (state_.startupMode == StartupMode::AutoStart) {
+		startNetwork();
+	} else {
+		resetJoinState();
+		ctx.lorawan.resetJoinTracking();
+	}
 }
 
 void App::disableRadios() {
@@ -85,6 +124,32 @@ void App::forceOtaaReset() {
 	ctx.lorawan.resetJoinTracking();
 }
 
+void App::startNetwork() {
+	state_.gate = GateState::Running;
+	resetJoinState();
+	ctx.lorawan.resetJoinTracking();
+}
+
+void App::detectBootInfo() {
+	esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+	state_.wakeCause = (cause == ESP_SLEEP_WAKEUP_UNDEFINED)
+							   ? BootWakeCause::ColdBoot
+							   : BootWakeCause::DeepSleepWake;
+	state_.startupMode = determineStartupMode(state_.wakeCause);
+
+	esp_reset_reason_t reason = esp_reset_reason();
+	state_.resetReason = static_cast<uint8_t>(reason);
+
+	Serial.printf("[boot] wake=%s reset=%s startup=%s\n",
+				  wakeCauseLabel(cause),
+				  resetReasonLabel(reason),
+				  (state_.startupMode == StartupMode::AutoStart) ? "AUTO" : "MANUAL");
+}
+
+StartupMode App::determineStartupMode(BootWakeCause cause) {
+	return (cause == BootWakeCause::DeepSleepWake) ? StartupMode::AutoStart : StartupMode::ManualStart;
+}
+
 void App::tick() {
 	uint32_t now = millis();
 
@@ -102,9 +167,7 @@ void App::tick() {
 		}
 	} else if (ctx.bootButton.consumeShortPress()) {
 		if (state_.initDone) {
-			state_.gate = GateState::Running;
-			resetJoinState();
-			ctx.lorawan.resetJoinTracking();
+			startNetwork();
 		} else {
 			ctx.display.showModeMessage("INIT...");
 			delay(400);
