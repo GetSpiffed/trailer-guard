@@ -207,8 +207,9 @@ void DisplaySh1106::renderMain(const AppState& state, float battVoltageV, uint8_
 										 : "READY: short=start long=otaa";
 			acceptScrollText(readyScroll_, readyLine, u8g2_, " ", 200);
 			drawMarqueeLoop(u8g2_, 42, readyScroll_, " <<< ", 3, 40);
-		// } else {
-		// 	u8g2_.drawStr(0, 42, "LORA: init...");
+		 }
+		// else {
+		//  	u8g2_.drawStr(0, 42, "LORA: init...");
 		// }
 	}
 
