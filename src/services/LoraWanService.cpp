@@ -177,6 +177,17 @@ void LoraWanService::resetJoinTracking() {
 	prevJoinState_ = JoinState::Fail;
 }
 
+bool LoraWanService::ensureOtaaInited(AppState& state) {
+	if (otaaInited_) return true;
+	int16_t st = node_.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
+	if (st != RADIOLIB_ERR_NONE) {
+		state.lastLoraErr = st;
+		return false;
+	}
+	otaaInited_ = true;
+	return true;
+}
+
 void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, TrackerService& tracker, uint16_t battMv) {
 	if (state.gate != GateState::Running) return;
 
@@ -209,7 +220,7 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 
 		case JoinState::Restore: {
 			LoRaWANSchemeSession_t session;
-			if (loadSession(session) && restoreSession(state, session)) {
+			if (loadSession(session) && ensureOtaaInited(state) && restoreSession(state, session)) {
 				state.sessionRestored = true;
 				state.testUplinkBackoff = 0;
 				state.joinState = JoinState::TestUplink;
@@ -265,18 +276,15 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 				return;
 			}
 
-			if (!otaaInited_) {
-				int16_t st = node_.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
-				if (st != RADIOLIB_ERR_NONE) {
-					state.lastLoraErr = st;
-					state.nextActionMs = now + AppConfig::JOIN_RETRY_MS;
-					return;
-				}
-				otaaInited_ = true;
-
-				(void)loadNoncesToNode(state, node_);
-				noncesLoaded_ = true;
+			if (!ensureOtaaInited(state)) {
+				state.nextActionMs = now + AppConfig::JOIN_RETRY_MS;
+				return;
 			}
+
+			if (!noncesLoaded_) {
+				(void)loadNoncesToNode(state, node_);
+			}
+			noncesLoaded_ = true;
 
 			state.joinAttempts++;
 

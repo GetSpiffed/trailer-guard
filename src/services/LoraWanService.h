@@ -72,6 +72,8 @@ private:
 	static bool saveNoncesFromNode(AppState& state, LoRaWANNode& node);
 	// Wis opgeslagen nonces uit NVS.
 	static void clearNonces();
+	// Zorg dat de OTAA-configuratie is geladen zodat sessieherstel werkt.
+	bool ensureOtaaInited(AppState& state);
 
 	template <typename NodeT, typename SessionT>
 	// Zet sessie op de node via pointer-overload indien beschikbaar.
