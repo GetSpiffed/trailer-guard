@@ -29,26 +29,53 @@ const char* joinStateLabel(JoinState state) {
 
 bool LoraWanService::loadSession(LoRaWANSchemeSession_t& session) {
 	Preferences prefs;
-	if (!prefs.begin("lorawan", true)) return false;
+	if (!prefs.begin("lorawan", true)) {
+		Serial.println("[lorawan] session load: prefs begin failed");
+		return false;
+	}
+	if (!prefs.isKey("session")) {
+		Serial.println("[lorawan] session load: no session key");
+		prefs.end();
+		return false;
+	}
 	size_t len = prefs.getBytesLength("session");
 	if (len != sizeof(StoredSession)) {
+		Serial.printf("[lorawan] session load: size mismatch len=%u expected=%u\n",
+					  static_cast<unsigned>(len),
+					  static_cast<unsigned>(sizeof(StoredSession)));
 		prefs.end();
 		return false;
 	}
 	StoredSession stored{};
 	size_t read = prefs.getBytes("session", &stored, sizeof(stored));
 	prefs.end();
-	if (read != sizeof(stored)) return false;
-	if (stored.magic != SESSION_MAGIC) return false;
-	if (stored.version != SESSION_VERSION) return false;
-	if (stored.size != sizeof(LoRaWANSchemeSession_t)) return false;
+	if (read != sizeof(stored)) {
+		Serial.printf("[lorawan] session load: read mismatch read=%u\n", static_cast<unsigned>(read));
+		return false;
+	}
+	if (stored.magic != SESSION_MAGIC) {
+		Serial.println("[lorawan] session load: magic mismatch");
+		return false;
+	}
+	if (stored.version != SESSION_VERSION) {
+		Serial.printf("[lorawan] session load: version mismatch %u\n", static_cast<unsigned>(stored.version));
+		return false;
+	}
+	if (stored.size != sizeof(LoRaWANSchemeSession_t)) {
+		Serial.printf("[lorawan] session load: payload size mismatch %u\n", static_cast<unsigned>(stored.size));
+		return false;
+	}
 	session = stored.session;
+	Serial.println("[lorawan] session load: ok");
 	return true;
 }
 
 bool LoraWanService::saveSession(const LoRaWANSchemeSession_t& session) {
 	Preferences prefs;
-	if (!prefs.begin("lorawan", false)) return false;
+	if (!prefs.begin("lorawan", false)) {
+		Serial.println("[lorawan] session save: prefs begin failed");
+		return false;
+	}
 	StoredSession stored{};
 	stored.magic = SESSION_MAGIC;
 	stored.version = SESSION_VERSION;
@@ -56,14 +83,19 @@ bool LoraWanService::saveSession(const LoRaWANSchemeSession_t& session) {
 	stored.session = session;
 	size_t written = prefs.putBytes("session", &stored, sizeof(stored));
 	prefs.end();
+	Serial.printf("[lorawan] session save: %s\n", written == sizeof(stored) ? "ok" : "failed");
 	return written == sizeof(stored);
 }
 
 void LoraWanService::clearSession() {
 	Preferences prefs;
-	if (!prefs.begin("lorawan", false)) return;
-	prefs.remove("session");
+	if (!prefs.begin("lorawan", false)) {
+		Serial.println("[lorawan] session clear: prefs begin failed");
+		return;
+	}
+	bool removed = prefs.remove("session");
 	prefs.end();
+	Serial.printf("[lorawan] session clear: %s\n", removed ? "ok" : "missing");
 }
 
 bool LoraWanService::initRadio(AppState& state) {
@@ -79,9 +111,11 @@ bool LoraWanService::initRadio(AppState& state) {
 bool LoraWanService::restoreSession(AppState& state, const LoRaWANSchemeSession_t& session) {
 	int16_t st = setNodeSession(node_, session, 0);
 	if (st != RADIOLIB_ERR_NONE) {
+		Serial.printf("[lorawan] session restore: failed err=%d\n", st);
 		state.lastLoraErr = st;
 		return false;
 	}
+	Serial.println("[lorawan] session restore: ok");
 	state.lastLoraErr = RADIOLIB_ERR_NONE;
 	return true;
 }
@@ -89,9 +123,11 @@ bool LoraWanService::restoreSession(AppState& state, const LoRaWANSchemeSession_
 bool LoraWanService::fetchSession(AppState& state, LoRaWANSchemeSession_t& session) {
 	int16_t st = getNodeSession(node_, session, 0);
 	if (st != RADIOLIB_ERR_NONE) {
+		Serial.printf("[lorawan] session fetch: failed err=%d\n", st);
 		state.lastLoraErr = st;
 		return false;
 	}
+	Serial.println("[lorawan] session fetch: ok");
 	state.lastLoraErr = RADIOLIB_ERR_NONE;
 	return true;
 }
@@ -130,10 +166,21 @@ bool LoraWanService::isUplinkOkError(int16_t err) {
 
 bool LoraWanService::loadNoncesToNode(AppState& state, LoRaWANNode& node) {
 	Preferences prefs;
-	if (!prefs.begin("lorawan", true)) return false;
+	if (!prefs.begin("lorawan", true)) {
+		Serial.println("[lorawan] nonces load: prefs begin failed");
+		return false;
+	}
+	if (!prefs.isKey("nonces")) {
+		Serial.println("[lorawan] nonces load: no nonces key");
+		prefs.end();
+		return false;
+	}
 
 	size_t len = prefs.getBytesLength("nonces");
 	if (len != sizeof(StoredNonces)) {
+		Serial.printf("[lorawan] nonces load: size mismatch len=%u expected=%u\n",
+					  static_cast<unsigned>(len),
+					  static_cast<unsigned>(sizeof(StoredNonces)));
 		prefs.end();
 		return false;
 	}
@@ -143,17 +190,28 @@ bool LoraWanService::loadNoncesToNode(AppState& state, LoRaWANNode& node) {
 	prefs.end();
 
 	if (read != sizeof(stored)) return false;
-	if (stored.magic != NONCES_MAGIC) return false;
-	if (stored.version != NONCES_VERSION) return false;
-	if (stored.size != RADIOLIB_LORAWAN_NONCES_BUF_SIZE) return false;
+	if (stored.magic != NONCES_MAGIC) {
+		Serial.println("[lorawan] nonces load: magic mismatch");
+		return false;
+	}
+	if (stored.version != NONCES_VERSION) {
+		Serial.printf("[lorawan] nonces load: version mismatch %u\n", static_cast<unsigned>(stored.version));
+		return false;
+	}
+	if (stored.size != RADIOLIB_LORAWAN_NONCES_BUF_SIZE) {
+		Serial.printf("[lorawan] nonces load: payload size mismatch %u\n", static_cast<unsigned>(stored.size));
+		return false;
+	}
 
 	int16_t st = node.setBufferNonces(stored.nonces);
 	if (st != RADIOLIB_ERR_NONE) {
+		Serial.printf("[lorawan] nonces load: node set failed err=%d\n", st);
 		state.lastLoraErr = st;
 		return false;
 	}
 
 	state.lastLoraErr = RADIOLIB_ERR_NONE;
+	Serial.println("[lorawan] nonces load: ok");
 	return true;
 }
 
@@ -165,6 +223,7 @@ bool LoraWanService::saveNoncesFromNode(AppState& state, LoRaWANNode& node) {
 
 	uint8_t* p = node.getBufferNonces();
 	if (!p) {
+		Serial.println("[lorawan] nonces save: node buffer missing");
 		state.lastLoraErr = RADIOLIB_ERR_UNKNOWN;
 		return false;
 	}
@@ -172,19 +231,27 @@ bool LoraWanService::saveNoncesFromNode(AppState& state, LoRaWANNode& node) {
 	memcpy(stored.nonces, p, RADIOLIB_LORAWAN_NONCES_BUF_SIZE);
 
 	Preferences prefs;
-	if (!prefs.begin("lorawan", false)) return false;
+	if (!prefs.begin("lorawan", false)) {
+		Serial.println("[lorawan] nonces save: prefs begin failed");
+		return false;
+	}
 	size_t written = prefs.putBytes("nonces", &stored, sizeof(stored));
 	prefs.end();
 
 	state.lastLoraErr = RADIOLIB_ERR_NONE;
+	Serial.printf("[lorawan] nonces save: %s\n", written == sizeof(stored) ? "ok" : "failed");
 	return written == sizeof(stored);
 }
 
 void LoraWanService::clearNonces() {
 	Preferences prefs;
-	if (!prefs.begin("lorawan", false)) return;
-	prefs.remove("nonces");
+	if (!prefs.begin("lorawan", false)) {
+		Serial.println("[lorawan] nonces clear: prefs begin failed");
+		return;
+	}
+	bool removed = prefs.remove("nonces");
 	prefs.end();
+	Serial.printf("[lorawan] nonces clear: %s\n", removed ? "ok" : "missing");
 }
 
 void LoraWanService::resetJoinTracking() {
@@ -197,10 +264,12 @@ bool LoraWanService::ensureOtaaInited(AppState& state) {
 	if (otaaInited_) return true;
 	int16_t st = node_.beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
 	if (st != RADIOLIB_ERR_NONE) {
+		Serial.printf("[lorawan] otaa init failed err=%d\n", st);
 		state.lastLoraErr = st;
 		return false;
 	}
 	otaaInited_ = true;
+	Serial.println("[lorawan] otaa init ok");
 	return true;
 }
 
@@ -249,7 +318,8 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 				state.joinState = JoinState::TestUplink;
 				state.nextActionMs = now + AppConfig::RESTORE_TEST_DELAY_MS;
 			} else {
-				Serial.println("[lorawan] no session restore, start join");
+				clearNonces();
+				Serial.println("[lorawan] no session restore, start join (OTAA)");
 				state.joinState = JoinState::Join;
 				state.nextActionMs = now;
 			}
@@ -281,7 +351,9 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 
 				state.nextUplinkMs = now + tracker.nextUplinkIntervalMs(fix);
 			} else if (isSessionInvalidError(st)) {
+				Serial.println("[lorawan] test uplink invalid session, restarting join");
 				clearSession();
+				clearNonces();
 				state.sessionRestored = false;
 
 				state.joinState = JoinState::Join;
@@ -305,12 +377,15 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 			}
 
 			if (!ensureOtaaInited(state)) {
+				Serial.println("[lorawan] join waiting for otaa init");
 				state.nextActionMs = now + AppConfig::JOIN_RETRY_MS;
 				return;
 			}
 
 			if (!noncesLoaded_) {
-				(void)loadNoncesToNode(state, node_);
+				if (!loadNoncesToNode(state, node_)) {
+					Serial.println("[lorawan] join nonces missing, continuing with fresh OTAA");
+				}
 			}
 			noncesLoaded_ = true;
 
@@ -371,7 +446,9 @@ void LoraWanService::updateUplinkFlow(AppState& state, const CurrentFix& fix, Tr
 			(void)saveSession(session);
 		}
 	} else if (isSessionInvalidError(st)) {
+		Serial.println("[lorawan] uplink invalid session, restarting join");
 		clearSession();
+		clearNonces();
 		state.joined = false;
 		state.sessionRestored = false;
 		state.joinState = JoinState::Join;
