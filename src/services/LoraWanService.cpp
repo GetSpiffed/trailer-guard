@@ -1,5 +1,7 @@
 #include "services/LoraWanService.h"
 
+#include <Arduino.h>
+
 #include "config/AppConfig.h"
 #include "secrets.h"
 
@@ -10,6 +12,20 @@
 LoraWanService::LoraWanService()
 		: node_(&radio_.radio(), &EU868) {
 }
+
+namespace {
+const char* joinStateLabel(JoinState state) {
+	switch (state) {
+		case JoinState::Radio: return "RADIO";
+		case JoinState::Restore: return "RESTORE";
+		case JoinState::TestUplink: return "TEST_UP";
+		case JoinState::Join: return "JOIN";
+		case JoinState::Ok: return "OK";
+		case JoinState::Fail: return "FAIL";
+		default: return "?";
+	}
+}
+} // namespace
 
 bool LoraWanService::loadSession(LoRaWANSchemeSession_t& session) {
 	Preferences prefs;
@@ -196,6 +212,7 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 	if (state.joinState == JoinState::Join && prevJoinState_ != JoinState::Join) {
 		otaaInited_ = false;
 		noncesLoaded_ = false;
+		Serial.printf("[lorawan] entering %s state\n", joinStateLabel(state.joinState));
 	}
 	prevJoinState_ = state.joinState;
 
@@ -204,10 +221,15 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 			if (now < state.nextActionMs) return;
 			state.radioReady = initRadio(state);
 			if (state.radioReady) {
+				Serial.println("[lorawan] radio init ok");
 				state.joinState = JoinState::Restore;
 				state.nextActionMs = now;
 			} else {
 				state.radioInitAttempts++;
+				Serial.printf("[lorawan] radio init fail (%u/%u) err=%d\n",
+							  static_cast<unsigned>(state.radioInitAttempts),
+							  static_cast<unsigned>(AppConfig::RADIO_INIT_MAX_ATTEMPTS),
+							  state.lastLoraErr);
 				if (state.radioInitAttempts >= AppConfig::RADIO_INIT_MAX_ATTEMPTS) {
 					state.joinState = JoinState::Fail;
 				} else {
@@ -221,11 +243,13 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 		case JoinState::Restore: {
 			LoRaWANSchemeSession_t session;
 			if (loadSession(session) && ensureOtaaInited(state) && restoreSession(state, session)) {
+				Serial.println("[lorawan] session restore ok, test uplink");
 				state.sessionRestored = true;
 				state.testUplinkBackoff = 0;
 				state.joinState = JoinState::TestUplink;
 				state.nextActionMs = now + AppConfig::RESTORE_TEST_DELAY_MS;
 			} else {
+				Serial.println("[lorawan] no session restore, start join");
 				state.joinState = JoinState::Join;
 				state.nextActionMs = now;
 			}
@@ -241,6 +265,9 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 			int16_t st = sendUplink(payload, n, AppConfig::LORAWAN_FPORT);
 			state.lastLoraErr = st;
 			state.uplinkResult = isUplinkOkError(st) ? UplinkResult::Ok : UplinkResult::Fail;
+			Serial.printf("[lorawan] test uplink result=%s err=%d\n",
+						  (state.uplinkResult == UplinkResult::Ok) ? "OK" : "FAIL",
+						  st);
 
 			if (state.uplinkResult == UplinkResult::Ok) {
 				state.joined = true;
@@ -273,6 +300,7 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 
 			if (state.joinAttempts >= AppConfig::JOIN_MAX_ATTEMPTS) {
 				state.joinState = JoinState::Fail;
+				Serial.println("[lorawan] join failed: max attempts reached");
 				return;
 			}
 
@@ -287,12 +315,16 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 			noncesLoaded_ = true;
 
 			state.joinAttempts++;
+			Serial.printf("[lorawan] join attempt %u/%u\n",
+						  static_cast<unsigned>(state.joinAttempts),
+						  static_cast<unsigned>(AppConfig::JOIN_MAX_ATTEMPTS));
 
 			int16_t st = node_.activateOTAA();
 			(void)saveNoncesFromNode(state, node_);
 
 			if (st != RADIOLIB_ERR_NONE && st != RADIOLIB_LORAWAN_NEW_SESSION) {
 				state.lastLoraErr = st;
+				Serial.printf("[lorawan] join attempt failed err=%d\n", st);
 				state.nextActionMs = now + AppConfig::JOIN_RETRY_MS;
 				return;
 			}
@@ -300,6 +332,7 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 			state.lastLoraErr = RADIOLIB_ERR_NONE;
 			state.joined = true;
 			state.joinState = JoinState::Ok;
+			Serial.println("[lorawan] join ok");
 			state.testUplinkBackoff = 0;
 
 			LoRaWANSchemeSession_t session;
