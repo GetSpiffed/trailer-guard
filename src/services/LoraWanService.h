@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <RadioLib.h>
+#include <array>
 
 #include "app/App.h"
 #include "drivers/LoraRadioSx1262.h"
@@ -19,22 +20,24 @@
 // Service die LoRaWAN join-, sessie- en uplinklogica beheert.
 class LoraWanService {
 public:
+	using SessionBuffer = std::array<uint8_t, RADIOLIB_LORAWAN_SESSION_BUF_SIZE>;
+
 	// Maak de service aan en configureer de node.
 	LoraWanService();
 
 	// Initialiseer de radiohardware en update status.
 	bool initRadio(AppState& state);
 	// Laad een opgeslagen LoRaWAN-sessie uit NVS.
-	bool loadSession(LoRaWANSchemeSession_t& session);
+	bool loadSession(SessionBuffer& session);
 	// Sla een LoRaWAN-sessie op in NVS.
-	bool saveSession(const LoRaWANSchemeSession_t& session);
+	bool saveSession(const SessionBuffer& session);
 	// Wis een opgeslagen LoRaWAN-sessie.
 	void clearSession();
 
 	// Herstel een sessie in de node en update state.
-	bool restoreSession(AppState& state, const LoRaWANSchemeSession_t& session);
+	bool restoreSession(AppState& state, const SessionBuffer& session);
 	// Lees de actuele sessie uit de node.
-	bool fetchSession(AppState& state, LoRaWANSchemeSession_t& session);
+	bool fetchSession(AppState& state, SessionBuffer& session);
 	// Verzend een uplinkpayload via de LoRaWAN-node.
 	int16_t sendUplink(const uint8_t* payload, size_t len, uint8_t fport);
 
@@ -51,7 +54,7 @@ private:
 		uint32_t magic;
 		uint16_t version;
 		uint16_t size;
-		LoRaWANSchemeSession_t session;
+		uint8_t session[RADIOLIB_LORAWAN_SESSION_BUF_SIZE];
 	};
 
 	// Gestructureerde opslag voor LoRaWAN nonces.
@@ -74,46 +77,6 @@ private:
 	static void clearNonces();
 	// Zorg dat de OTAA-configuratie is geladen zodat sessieherstel werkt.
 	bool ensureOtaaInited(AppState& state);
-
-	template <typename NodeT, typename SessionT>
-	// Zet sessie op de node via pointer-overload indien beschikbaar.
-	static auto setNodeSession(NodeT& target, const SessionT& session, int)
-			-> decltype(target.setSession(&session), int16_t()) {
-		return target.setSession(&session);
-	}
-
-	template <typename NodeT, typename SessionT>
-	// Zet sessie op de node via value-overload indien beschikbaar.
-	static auto setNodeSession(NodeT& target, const SessionT& session, long)
-			-> decltype(target.setSession(session), int16_t()) {
-		return target.setSession(session);
-	}
-
-	template <typename NodeT, typename SessionT>
-	// Fallback voor setSession wanneer niet ondersteund.
-	static int16_t setNodeSession(NodeT&, const SessionT&, ...) {
-		return RADIOLIB_ERR_UNSUPPORTED;
-	}
-
-	template <typename NodeT, typename SessionT>
-	// Lees sessie uit de node via pointer-overload indien beschikbaar.
-	static auto getNodeSession(NodeT& target, SessionT& session, int)
-			-> decltype(target.getSession(&session), int16_t()) {
-		return target.getSession(&session);
-	}
-
-	template <typename NodeT, typename SessionT>
-	// Lees sessie uit de node via value-overload indien beschikbaar.
-	static auto getNodeSession(NodeT& target, SessionT& session, long)
-			-> decltype(target.getSession(session), int16_t()) {
-		return target.getSession(session);
-	}
-
-	template <typename NodeT, typename SessionT>
-	// Fallback voor getSession wanneer niet ondersteund.
-	static int16_t getNodeSession(NodeT&, SessionT&, ...) {
-		return RADIOLIB_ERR_UNSUPPORTED;
-	}
 
 	// Magic om sessiedata in opslag te herkennen.
 	static constexpr uint32_t SESSION_MAGIC = 0x4C57534Eu; // "LWSN"

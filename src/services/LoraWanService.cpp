@@ -1,6 +1,7 @@
 #include "services/LoraWanService.h"
 
 #include <Arduino.h>
+#include <cstring>
 
 #include "config/AppConfig.h"
 #include "secrets.h"
@@ -27,7 +28,7 @@ const char* joinStateLabel(JoinState state) {
 }
 } // namespace
 
-bool LoraWanService::loadSession(LoRaWANSchemeSession_t& session) {
+bool LoraWanService::loadSession(SessionBuffer& session) {
 	Preferences prefs;
 	if (!prefs.begin("lorawan", true)) {
 		Serial.println("[lorawan] session load: prefs begin failed");
@@ -61,16 +62,16 @@ bool LoraWanService::loadSession(LoRaWANSchemeSession_t& session) {
 		Serial.printf("[lorawan] session load: version mismatch %u\n", static_cast<unsigned>(stored.version));
 		return false;
 	}
-	if (stored.size != sizeof(LoRaWANSchemeSession_t)) {
+	if (stored.size != RADIOLIB_LORAWAN_SESSION_BUF_SIZE) {
 		Serial.printf("[lorawan] session load: payload size mismatch %u\n", static_cast<unsigned>(stored.size));
 		return false;
 	}
-	session = stored.session;
+	memcpy(session.data(), stored.session, RADIOLIB_LORAWAN_SESSION_BUF_SIZE);
 	Serial.println("[lorawan] session load: ok");
 	return true;
 }
 
-bool LoraWanService::saveSession(const LoRaWANSchemeSession_t& session) {
+bool LoraWanService::saveSession(const SessionBuffer& session) {
 	Preferences prefs;
 	if (!prefs.begin("lorawan", false)) {
 		Serial.println("[lorawan] session save: prefs begin failed");
@@ -79,8 +80,8 @@ bool LoraWanService::saveSession(const LoRaWANSchemeSession_t& session) {
 	StoredSession stored{};
 	stored.magic = SESSION_MAGIC;
 	stored.version = SESSION_VERSION;
-	stored.size = sizeof(LoRaWANSchemeSession_t);
-	stored.session = session;
+	stored.size = RADIOLIB_LORAWAN_SESSION_BUF_SIZE;
+	memcpy(stored.session, session.data(), RADIOLIB_LORAWAN_SESSION_BUF_SIZE);
 	size_t written = prefs.putBytes("session", &stored, sizeof(stored));
 	prefs.end();
 	Serial.printf("[lorawan] session save: %s\n", written == sizeof(stored) ? "ok" : "failed");
@@ -108,8 +109,8 @@ bool LoraWanService::initRadio(AppState& state) {
 	return true;
 }
 
-bool LoraWanService::restoreSession(AppState& state, const LoRaWANSchemeSession_t& session) {
-	int16_t st = setNodeSession(node_, session, 0);
+bool LoraWanService::restoreSession(AppState& state, const SessionBuffer& session) {
+	int16_t st = node_.setBufferSession(session.data());
 	if (st != RADIOLIB_ERR_NONE) {
 		Serial.printf("[lorawan] session restore: failed err=%d\n", st);
 		state.lastLoraErr = st;
@@ -120,13 +121,14 @@ bool LoraWanService::restoreSession(AppState& state, const LoRaWANSchemeSession_
 	return true;
 }
 
-bool LoraWanService::fetchSession(AppState& state, LoRaWANSchemeSession_t& session) {
-	int16_t st = getNodeSession(node_, session, 0);
-	if (st != RADIOLIB_ERR_NONE) {
-		Serial.printf("[lorawan] session fetch: failed err=%d\n", st);
-		state.lastLoraErr = st;
+bool LoraWanService::fetchSession(AppState& state, SessionBuffer& session) {
+	uint8_t* p = node_.getBufferSession();
+	if (!p) {
+		Serial.printf("[lorawan] session fetch: failed err=%d\n", RADIOLIB_ERR_NULL_POINTER);
+		state.lastLoraErr = RADIOLIB_ERR_NULL_POINTER;
 		return false;
 	}
+	memcpy(session.data(), p, RADIOLIB_LORAWAN_SESSION_BUF_SIZE);
 	Serial.println("[lorawan] session fetch: ok");
 	state.lastLoraErr = RADIOLIB_ERR_NONE;
 	return true;
@@ -310,7 +312,7 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 		}
 
 		case JoinState::Restore: {
-			LoRaWANSchemeSession_t session;
+			SessionBuffer session{};
 			if (loadSession(session) && ensureOtaaInited(state) && restoreSession(state, session)) {
 				Serial.println("[lorawan] session restore ok, test uplink");
 				state.sessionRestored = true;
@@ -344,7 +346,7 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 				state.joinState = JoinState::Ok;
 				state.testUplinkBackoff = 0;
 
-				LoRaWANSchemeSession_t saved;
+				SessionBuffer saved{};
 				if (fetchSession(state, saved)) {
 					(void)saveSession(saved);
 				}
@@ -410,7 +412,7 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 			Serial.println("[lorawan] join ok");
 			state.testUplinkBackoff = 0;
 
-			LoRaWANSchemeSession_t session;
+			SessionBuffer session{};
 			if (fetchSession(state, session)) {
 				(void)saveSession(session);
 			}
@@ -441,7 +443,7 @@ void LoraWanService::updateUplinkFlow(AppState& state, const CurrentFix& fix, Tr
 
 	if (state.uplinkResult == UplinkResult::Ok) {
 		state.lastUplinkOkMs = now;
-		LoRaWANSchemeSession_t session;
+		SessionBuffer session{};
 		if (fetchSession(state, session)) {
 			(void)saveSession(session);
 		}

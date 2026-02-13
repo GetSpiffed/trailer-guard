@@ -106,7 +106,7 @@ void App::resetJoinState() {
 void App::forceOtaaReset() {
 	ctx.lorawan.clearSession();
 
-	LoRaWANSchemeSession_t tmp;
+	LoraWanService::SessionBuffer tmp{};
 	bool stillThere = ctx.lorawan.loadSession(tmp);
 	ctx.display.showModeMessage(stillThere ? "CLEAR FAIL?!" : "SESSION CLEARED");
 	delay(900);
