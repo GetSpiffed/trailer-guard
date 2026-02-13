@@ -320,7 +320,6 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 				state.joinState = JoinState::TestUplink;
 				state.nextActionMs = now + AppConfig::RESTORE_TEST_DELAY_MS;
 			} else {
-				clearNonces();
 				Serial.println("[lorawan] no session restore, start join (OTAA)");
 				state.joinState = JoinState::Join;
 				state.nextActionMs = now;
@@ -385,11 +384,12 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 			}
 
 			if (!noncesLoaded_) {
-				if (!loadNoncesToNode(state, node_)) {
+				if (loadNoncesToNode(state, node_)) {
+					noncesLoaded_ = true;
+				} else {
 					Serial.println("[lorawan] join nonces missing, continuing with fresh OTAA");
 				}
 			}
-			noncesLoaded_ = true;
 
 			state.joinAttempts++;
 			Serial.printf("[lorawan] join attempt %u/%u\n",
