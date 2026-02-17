@@ -2,6 +2,9 @@
 
 #include <Arduino.h>
 
+#include "drivers/GpsL76k.h"
+#include "services/FixSnapshot.h"
+
 // Hoofdtoestand van de applicatiegate.
 enum class GateState : uint8_t {
 	WaitingForBoot,
@@ -69,6 +72,7 @@ public:
 	void tick();
 
 private:
+	void fixSnapshotUpdate(const CurrentFix& fix, uint32_t nowMs);
 	// Schakel WiFi/Bluetooth uit om energie te besparen.
 	void disableRadios();
 	// Zet join-gerelateerde state terug naar defaults.
@@ -83,4 +87,5 @@ private:
 	static StartupMode determineStartupMode(BootWakeCause cause);
 
 	AppState state_;
+	FixSnapshot fixSnapshot_;
 };

@@ -138,34 +138,6 @@ int16_t LoraWanService::sendUplink(const uint8_t* payload, size_t len, uint8_t f
 	return node_.sendReceive(payload, len, fport);
 }
 
-bool LoraWanService::isSessionInvalidError(int16_t err) {
-	switch (err) {
-#ifdef RADIOLIB_ERR_MIC_MISMATCH
-		case RADIOLIB_ERR_MIC_MISMATCH:
-#endif
-#ifdef RADIOLIB_ERR_INVALID_FCNT
-		case RADIOLIB_ERR_INVALID_FCNT:
-#endif
-#ifdef RADIOLIB_ERR_DOWNLINK_MALFORMED
-		case RADIOLIB_ERR_DOWNLINK_MALFORMED:
-#endif
-			return true;
-		default:
-			return false;
-	}
-}
-
-bool LoraWanService::isUplinkOkError(int16_t err) {
-	if (err == RADIOLIB_ERR_NONE) return true;
-#ifdef RADIOLIB_ERR_RX_TIMEOUT
-	if (err == RADIOLIB_ERR_RX_TIMEOUT) return true;
-#endif
-#ifdef RADIOLIB_ERR_TIMEOUT
-	if (err == RADIOLIB_ERR_TIMEOUT) return true;
-#endif
-	return false;
-}
-
 bool LoraWanService::loadNoncesToNode(AppState& state, LoRaWANNode& node) {
 	Preferences prefs;
 	if (!prefs.begin("lorawan", true)) {
@@ -275,7 +247,7 @@ bool LoraWanService::ensureOtaaInited(AppState& state) {
 	return true;
 }
 
-void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, TrackerService& tracker, uint16_t battMv) {
+void LoraWanService::updateJoinFlow(AppState& state) {
 	if (state.gate != GateState::Running) return;
 
 	uint32_t now = millis();
@@ -314,11 +286,11 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 		case JoinState::Restore: {
 			SessionBuffer session{};
 			if (loadSession(session) && ensureOtaaInited(state) && restoreSession(state, session)) {
-				Serial.println("[lorawan] session restore ok, test uplink");
+				Serial.println("[lorawan] session restore ok");
 				state.sessionRestored = true;
-				state.testUplinkBackoff = 0;
-				state.joinState = JoinState::TestUplink;
-				state.nextActionMs = now + AppConfig::RESTORE_TEST_DELAY_MS;
+				state.joined = true;
+				state.joinState = JoinState::Ok;
+				state.nextActionMs = now;
 			} else {
 				Serial.println("[lorawan] no session restore, start join (OTAA)");
 				state.joinState = JoinState::Join;
@@ -327,46 +299,6 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 			break;
 		}
 
-		case JoinState::TestUplink: {
-			if (now < state.nextActionMs) return;
-
-			uint8_t payload[24];
-			size_t n = tracker.buildPayload(payload, sizeof(payload), fix, battMv);
-
-			int16_t st = sendUplink(payload, n, AppConfig::LORAWAN_FPORT);
-			state.lastLoraErr = st;
-			state.uplinkResult = isUplinkOkError(st) ? UplinkResult::Ok : UplinkResult::Fail;
-			Serial.printf("[lorawan] test uplink result=%s err=%d\n",
-						  (state.uplinkResult == UplinkResult::Ok) ? "OK" : "FAIL",
-						  st);
-
-			if (state.uplinkResult == UplinkResult::Ok) {
-				state.joined = true;
-				state.joinState = JoinState::Ok;
-				state.testUplinkBackoff = 0;
-
-				SessionBuffer saved{};
-				if (fetchSession(state, saved)) {
-					(void)saveSession(saved);
-				}
-
-				state.nextUplinkMs = now + tracker.nextUplinkIntervalMs(fix);
-			} else if (isSessionInvalidError(st)) {
-				Serial.println("[lorawan] test uplink invalid session, restarting join");
-				clearSession();
-				clearNonces();
-				state.sessionRestored = false;
-
-				state.joinState = JoinState::Join;
-				state.nextActionMs = now;
-			} else {
-				if (state.testUplinkBackoff < 5) state.testUplinkBackoff++;
-				uint32_t backoffMs = AppConfig::JOIN_RETRY_MS + static_cast<uint32_t>(state.testUplinkBackoff) * 10000;
-				state.joinState = JoinState::TestUplink;
-				state.nextActionMs = now + backoffMs;
-			}
-			break;
-		}
 
 		case JoinState::Join: {
 			if (now < state.nextActionMs) return;
@@ -417,7 +349,6 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 				(void)saveSession(session);
 			}
 
-			state.nextUplinkMs = now + tracker.nextUplinkIntervalMs(fix);
 			break;
 		}
 
@@ -426,36 +357,4 @@ void LoraWanService::updateJoinFlow(AppState& state, const CurrentFix& fix, Trac
 		default:
 			break;
 	}
-}
-
-void LoraWanService::updateUplinkFlow(AppState& state, const CurrentFix& fix, TrackerService& tracker, uint16_t battMv) {
-	if (!state.joined) return;
-
-	uint32_t now = millis();
-	if (state.nextUplinkMs == 0 || now < state.nextUplinkMs) return;
-
-	uint8_t payload[24];
-	size_t n = tracker.buildPayload(payload, sizeof(payload), fix, battMv);
-
-	int16_t st = sendUplink(payload, n, AppConfig::LORAWAN_FPORT);
-	state.lastLoraErr = st;
-	state.uplinkResult = isUplinkOkError(st) ? UplinkResult::Ok : UplinkResult::Fail;
-
-	if (state.uplinkResult == UplinkResult::Ok) {
-		state.lastUplinkOkMs = now;
-		SessionBuffer session{};
-		if (fetchSession(state, session)) {
-			(void)saveSession(session);
-		}
-	} else if (isSessionInvalidError(st)) {
-		Serial.println("[lorawan] uplink invalid session, restarting join");
-		clearSession();
-		clearNonces();
-		state.joined = false;
-		state.sessionRestored = false;
-		state.joinState = JoinState::Join;
-		state.nextActionMs = now + AppConfig::JOIN_RETRY_MS;
-	}
-
-	state.nextUplinkMs = now + tracker.nextUplinkIntervalMs(fix);
 }
