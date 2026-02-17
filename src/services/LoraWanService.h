@@ -7,7 +7,6 @@
 
 #include "app/App.h"
 #include "drivers/LoraRadioSx1262.h"
-#include "services/TrackerService.h"
 
 #ifndef RADIOLIB_ERR_UNSUPPORTED
 #define RADIOLIB_ERR_UNSUPPORTED RADIOLIB_ERR_UNKNOWN
@@ -43,10 +42,8 @@ public:
 
 	// Reset join-gerelateerde interne tracking.
 	void resetJoinTracking();
-	// Verwerk het joinproces en test-uplinks.
-	void updateJoinFlow(AppState& state, const CurrentFix& fix, TrackerService& tracker, uint16_t battMv);
-	// Verwerk periodieke uplinks na een succesvolle join.
-	void updateUplinkFlow(AppState& state, const CurrentFix& fix, TrackerService& tracker, uint16_t battMv);
+	// Verwerk het joinproces.
+	void updateJoinFlow(AppState& state);
 
 private:
 	// Gestructureerde opslag voor een LoRaWAN-sessie.
@@ -65,10 +62,6 @@ private:
 		uint8_t nonces[RADIOLIB_LORAWAN_NONCES_BUF_SIZE];
 	};
 
-	// Controleer of een foutcode duidt op een ongeldige sessie.
-	static bool isSessionInvalidError(int16_t err);
-	// Controleer of een uplinkresultaat functioneel OK is.
-	static bool isUplinkOkError(int16_t err);
 	// Laad opgeslagen nonces naar de nodebuffer.
 	static bool loadNoncesToNode(AppState& state, LoRaWANNode& node);
 	// Sla huidige nonces uit de nodebuffer op.

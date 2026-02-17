@@ -12,7 +12,8 @@
 #include "drivers/GpsL76k.h"
 #include "drivers/PowerAxp2101.h"
 #include "services/LoraWanService.h"
-#include "services/TrackerService.h"
+#include "services/TelemetryService.h"
+#include "services/UplinkScheduler.h"
 
 // Bundelt hardwaredrivers en services voor gedeeld gebruik.
 class AppContext {
@@ -21,14 +22,29 @@ public:
 	PowerAxp2101 power;
 	DisplaySh1106 display;
 	GpsL76k gps;
-	TrackerService tracker;
 	LoraWanService lorawan;
+	TelemetryService telemetry;
+	UplinkScheduler scheduler;
 };
 
 // Globale contextinstantie voor de applicatie.
 static AppContext ctx;
 
 namespace {
+uint8_t readBatteryPercentFromPmu() {
+	return ctx.power.readBatteryPercent();
+}
+
+void printPayloadHex(const std::vector<uint8_t>& payload) {
+	Serial.print("[uplink] payload=");
+	for (size_t i = 0; i < payload.size(); ++i) {
+		if (payload[i] < 16) Serial.print('0');
+		Serial.print(payload[i], HEX);
+		if (i + 1 < payload.size()) Serial.print(' ');
+	}
+	Serial.println();
+}
+
 const char* wakeCauseLabel(esp_sleep_wakeup_cause_t cause) {
 	switch (cause) {
 		case ESP_SLEEP_WAKEUP_UNDEFINED: return "COLD/RESET";
@@ -71,6 +87,10 @@ void App::begin() {
 	disableRadios();
 	ctx.gps.begin();
 
+	ctx.telemetry.begin(&fixSnapshot_);
+	ctx.telemetry.bindBatteryReader(readBatteryPercentFromPmu);
+	ctx.scheduler.begin(300000);
+
 	state_.initDone = true;
 	detectBootInfo();
 
@@ -101,6 +121,7 @@ void App::resetJoinState() {
 	state_.sessionRestored = false;
 	state_.testUplinkBackoff = 0;
 	state_.forceOtaaThisBoot = false;
+	ctx.scheduler.begin(300000);
 }
 
 void App::forceOtaaReset() {
@@ -122,6 +143,7 @@ void App::forceOtaaReset() {
 	state_.joinAttempts = 0;
 	state_.testUplinkBackoff = 0;
 	ctx.lorawan.resetJoinTracking();
+	ctx.scheduler.begin(300000);
 }
 
 void App::startNetwork() {
@@ -150,6 +172,27 @@ StartupMode App::determineStartupMode(BootWakeCause cause) {
 	return (cause == BootWakeCause::DeepSleepWake) ? StartupMode::AutoStart : StartupMode::ManualStart;
 }
 
+void App::fixSnapshotUpdate(const CurrentFix& fix, uint32_t nowMs) {
+	fixSnapshot_.hasFix = fix.hasFix;
+	fixSnapshot_.latE7 = fix.hasFix ? static_cast<int32_t>(lroundf(fix.lat * 10000000.0f)) : 0;
+	fixSnapshot_.lonE7 = fix.hasFix ? static_cast<int32_t>(lroundf(fix.lon * 10000000.0f)) : 0;
+
+	if (fix.hasFix && fix.hasSpeed) {
+		int32_t kmh = static_cast<int32_t>(lroundf(fix.speedMps * 3.6f));
+		if (kmh < 0) kmh = 0;
+		if (kmh > 255) kmh = 255;
+		fixSnapshot_.speedKmh = static_cast<uint8_t>(kmh);
+	} else {
+		fixSnapshot_.speedKmh = 0;
+	}
+
+	if (fix.lastFixMs > 0 && nowMs >= fix.lastFixMs) {
+		fixSnapshot_.ageMs = nowMs - fix.lastFixMs;
+	} else {
+		fixSnapshot_.ageMs = 0;
+	}
+}
+
 void App::tick() {
 	uint32_t now = millis();
 
@@ -174,24 +217,43 @@ void App::tick() {
 		}
 	}
 
-	CurrentFix fix = ctx.gps.getFix();
-	uint16_t battMv = ctx.power.readBatteryMv();
-
 	JoinState prevJoinState = state_.joinState;
-	ctx.lorawan.updateJoinFlow(state_, fix, ctx.tracker, battMv);
+	ctx.lorawan.updateJoinFlow(state_);
 	if (prevJoinState != JoinState::Ok && state_.joinState == JoinState::Ok) {
 		ctx.gps.anchorToCurrent();
+		ctx.scheduler.onLinkReady();
+		Serial.printf("[lorawan] link ready (%s)\n", state_.sessionRestored ? "restore" : "otaa");
 	}
 
-	uint32_t prevLastUplinkOkMs = state_.lastUplinkOkMs;
-	ctx.lorawan.updateUplinkFlow(state_, fix, ctx.tracker, battMv);
-	if (state_.lastUplinkOkMs != prevLastUplinkOkMs) {
-		ctx.gps.anchorToCurrent();
+	if (ctx.scheduler.loop(now)) {
+		Telemetry telemetry = ctx.telemetry.collect();
+		std::vector<uint8_t> payload = ctx.telemetry.encode(telemetry);
+		printPayloadHex(payload);
+
+		int16_t st = ctx.lorawan.sendUplink(payload.data(), payload.size(), AppConfig::LORAWAN_FPORT);
+		state_.lastLoraErr = st;
+		if (st == RADIOLIB_ERR_NONE) {
+			state_.uplinkResult = UplinkResult::Ok;
+			state_.lastUplinkOkMs = now;
+			ctx.scheduler.markSent(now);
+			Serial.println("[uplink] send ok (unconfirmed)");
+		} else {
+			state_.uplinkResult = UplinkResult::Fail;
+			Serial.printf("[uplink] send fail err=%d\n", st);
+		}
+	}
+
+	static uint32_t lastStatusLogMs = 0;
+	if (state_.joined && now - lastStatusLogMs >= 10000) {
+		lastStatusLogMs = now;
+		Serial.printf("[uplink] next send in %lus\n", static_cast<unsigned long>(ctx.scheduler.secondsUntilNext(now)));
 	}
 
 	static uint32_t lastDrawMs = 0;
 	if (now - lastDrawMs >= 250) {
 		lastDrawMs = now;
+		CurrentFix fix = ctx.gps.getFix();
+		fixSnapshotUpdate(fix, now);
 		if (ctx.bootButton.inHoldUi()) {
 			ctx.display.showBootHold(ctx.bootButton.getHeldMs());
 		} else {
